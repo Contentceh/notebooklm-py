@@ -46,6 +46,8 @@ Once the fork is cloned, stack/integration notes should live in:
 - Repo-local planning docs were moved into `docs/local-stack/`.
 - Host bootstrap is now green through auth and minimal smoke testing.
 - Current auth source is a copied-in `storage_state.json` under `.local/notebooklm-home/profiles/default/`.
+- Docker-side MVP bridge now runs through the `python-runner` service in `infra-n8n-setup`.
+- Current bridge endpoints are available to `n8n` at `http://python-runner:8000/notebooklm/...`.
 
 ## Stage 1 sequence
 

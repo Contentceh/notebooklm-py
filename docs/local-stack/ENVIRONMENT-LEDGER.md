@@ -73,3 +73,11 @@ Purpose: track everything added on the host for Stage 1, so it can be cleaned up
 - smoke source wait result: `.local/work/smoke-source-wait.json`
 - smoke ask result: `.local/work/smoke-ask-with-source.json`
 - temporary smoke notebook ID: `3a3b265d-975d-4290-a385-0c2cb5fe4f4d`
+
+## Docker bridge status
+
+- Docker integration point: `infra-n8n-setup/python-runner`
+- Compose mount added: `./notebooklm-py:/opt/notebooklm-py`
+- Compose env added: `NOTEBOOKLM_HOME`, `NOTEBOOKLM_PROFILE`, `NOTEBOOKLM_CLI_TIMEOUT_SECONDS`, `PLAYWRIGHT_BROWSERS_PATH`
+- Container dependency added: `python-runner/requirements.txt` includes `-e /opt/notebooklm-py`
+- Container-side smoke passed from the `n8n` runtime network for health, list, and ask endpoints

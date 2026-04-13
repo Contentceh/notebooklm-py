@@ -30,13 +30,15 @@ Current status:
 - Stage 1 host bootstrap is operational on the host
 - NotebookLM auth works from repo-local `storage_state.json`
 - minimal smoke path is proven against the real service
+- Docker-side MVP bridge is operational through `python-runner`
+- `n8n` network smoke is green for `/notebooklm/healthz`, `/notebooklm/list`, and `/notebooklm/ask`
 
 ## Stage 2 — decide on Docker
 
-- [ ] Decide whether runtime should stay on host or move into Docker
-- [ ] If Docker is chosen, define auth/state handoff from `.local/notebooklm-home`
-- [ ] Define compose mount/env layout
-- [ ] Validate Docker-side smoke test
+- [x] Decide whether runtime should stay on host or move into Docker — MVP bridge now runs in Docker via `python-runner`
+- [x] If Docker is chosen, define auth/state handoff from `.local/notebooklm-home`
+- [x] Define compose mount/env layout
+- [x] Validate Docker-side smoke test
 
 ## Stage 3 — cleanup after Docker migration
 

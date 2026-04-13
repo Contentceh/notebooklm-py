@@ -7,7 +7,7 @@
 - Repo-specific notes should also live **inside that fork**, not in a separate top-level docs area.
 - Org policy: stack-owned repos should use the `Contentceh` organization as `origin` when applicable.
 - Stage 1 is still done **without Docker**.
-- Docker is Stage 2, after host-side login/auth/smoke test succeed.
+- Docker is Stage 2, after host-side auth/smoke test succeed.
 
 ## Preferred final layout
 
@@ -40,10 +40,12 @@ Once the fork is cloned, stack/integration notes should live in:
 - later Docker integration can mount the repo subtree directly if needed;
 - `.venv` and `.local/` can stay gitignored.
 
-## Transitional note
+## Current state
 
-Right now the fork is **not cloned yet**, so the current files under `n8n-install/docs/notebooklm-py/` are temporary planning notes only.
-After clone, they should be moved into the fork under `notebooklm-py/docs/local-stack/`.
+- The fork is cloned at `/home/vgoro/n8n-install/notebooklm-py`.
+- Repo-local planning docs were moved into `docs/local-stack/`.
+- Host bootstrap is now green through auth and minimal smoke testing.
+- Current auth source is a copied-in `storage_state.json` under `.local/notebooklm-home/profiles/default/`.
 
 ## Stage 1 sequence
 
@@ -53,7 +55,7 @@ After clone, they should be moved into the fork under `notebooklm-py/docs/local-
 4. Set `PLAYWRIGHT_BROWSERS_PATH=/home/vgoro/n8n-install/notebooklm-py/.local/ms-playwright`.
 5. Install `notebooklm-py[browser]`.
 6. Install Playwright Chromium.
-6. Run `notebooklm login`.
+6. Provide auth either via `notebooklm login` on a GUI-capable machine or by copying in a valid `storage_state.json`.
 7. Run `notebooklm auth check --test`.
-8. Run minimal smoke test.
+8. Run minimal smoke test (list notebooks -> create smoke notebook -> add source -> ask).
 9. Only after that decide whether Docker migration is worth doing.

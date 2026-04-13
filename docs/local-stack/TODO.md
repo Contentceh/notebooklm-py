@@ -18,17 +18,18 @@
 - [x] Ensure `.venv` and `.local/` are gitignored in the fork
 - [x] Install `notebooklm-py[browser]`
 - [x] Install Playwright Chromium
-- [ ] Run `notebooklm login`
-- [x] Run baseline `notebooklm auth check` (shows missing `storage_state.json`)
-- [ ] Run `notebooklm auth check --test`
-- [ ] Run smoke test: list notebooks / create test notebook / simple ask flow
-
-Current blocker:
-
-- server-side auth is still missing (`storage_state.json` does not exist yet)
-- no reusable browser cookie DB was found under `/home/vgoro`
-- to continue, we need either a successful `notebooklm login` with usable GUI/browser interaction or a copied-in auth state (`storage_state.json` / `NOTEBOOKLM_AUTH_JSON`)
+- [ ] Run `notebooklm login` (optional if auth is copied in from another machine)
+- [x] Copy in valid `storage_state.json` auth state
+- [x] Run baseline `notebooklm auth check`
+- [x] Run `notebooklm auth check --test`
+- [x] Run smoke test: list notebooks / create test notebook / add source / ask flow
 - [x] Record all host-side deltas in `ENVIRONMENT-LEDGER.md`
+
+Current status:
+
+- Stage 1 host bootstrap is operational on the host
+- NotebookLM auth works from repo-local `storage_state.json`
+- minimal smoke path is proven against the real service
 
 ## Stage 2 — decide on Docker
 

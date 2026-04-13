@@ -46,7 +46,7 @@ Purpose: track everything added on the host for Stage 1, so it can be cleaned up
 ### NotebookLM auth artifacts
 
 - `NOTEBOOKLM_HOME` used: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home`
-- `storage_state.json` path: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home/profiles/default/storage_state.json` (currently absent)
+- `storage_state.json` path: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home/profiles/default/storage_state.json` (present)
 - extra profiles used: none
 
 ### Cleanup candidates after Docker migration
@@ -57,8 +57,19 @@ Purpose: track everything added on the host for Stage 1, so it can be cleaned up
 
 ## Current bootstrap status
 
-- repo bootstrap is green up to package install and Playwright browser download
+- repo bootstrap is green through package install, Playwright browser download, auth validation, and minimal smoke testing
 - `notebooklm --version` works (`0.3.4`)
 - `notebooklm doctor --fix` succeeded for profile-dir creation
-- remaining blocker is authentication: `auth check` reports missing `storage_state.json`
-- no existing browser cookie DB or prior NotebookLM auth state was found under `/home/vgoro`
+- `notebooklm auth check --test --json` returned `status: ok`
+- auth is currently provided by repo-local `storage_state.json`
+- minimal smoke path passed: create notebook -> add pasted-text source -> wait ready -> ask with cited answer
+
+## Smoke artifacts
+
+- auth check result: `.local/work/auth-check-test.json`
+- list output before smoke: `.local/work/list-before.txt`
+- smoke notebook create result: `.local/work/create-smoke.json`
+- smoke source add result: `.local/work/smoke-source-add.json`
+- smoke source wait result: `.local/work/smoke-source-wait.json`
+- smoke ask result: `.local/work/smoke-ask-with-source.json`
+- temporary smoke notebook ID: `3a3b265d-975d-4290-a385-0c2cb5fe4f4d`

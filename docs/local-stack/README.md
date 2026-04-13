@@ -21,6 +21,7 @@
 
 - Bootstrap venv: `/home/vgoro/n8n-install/notebooklm-py/.venv`
 - NotebookLM home/auth: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home`
+- Playwright browser cache: `/home/vgoro/n8n-install/notebooklm-py/.local/ms-playwright`
 - Optional work area: `/home/vgoro/n8n-install/notebooklm-py/.local/work`
 
 ### Repo-local documentation
@@ -49,8 +50,9 @@ After clone, they should be moved into the fork under `notebooklm-py/docs/local-
 1. Clone the fork into `/home/vgoro/n8n-install/notebooklm-py`.
 2. Create `.venv` inside that repo.
 3. Set `NOTEBOOKLM_HOME=/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home`.
-4. Install `notebooklm-py[browser]`.
-5. Install Playwright Chromium.
+4. Set `PLAYWRIGHT_BROWSERS_PATH=/home/vgoro/n8n-install/notebooklm-py/.local/ms-playwright`.
+5. Install `notebooklm-py[browser]`.
+6. Install Playwright Chromium.
 6. Run `notebooklm login`.
 7. Run `notebooklm auth check --test`.
 8. Run minimal smoke test.

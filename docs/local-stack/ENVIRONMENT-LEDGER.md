@@ -7,44 +7,58 @@ Purpose: track everything added on the host for Stage 1, so it can be cleaned up
 - Fork working tree: `/home/vgoro/n8n-install/notebooklm-py`
 - Host bootstrap venv: `/home/vgoro/n8n-install/notebooklm-py/.venv`
 - NotebookLM home: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home`
+- Playwright browser cache: `/home/vgoro/n8n-install/notebooklm-py/.local/ms-playwright`
 - Optional working area: `/home/vgoro/n8n-install/notebooklm-py/.local/work`
 
 ## Repo metadata
 
 - Fork remote URL: `https://github.com/Contentceh/notebooklm-py.git`
 - Upstream remote URL: `https://github.com/teng-lin/notebooklm-py`
-- Branch used:
+- Branch used: `main`
 
 ## Record actual deltas here
 
 ### Python runtime
 
-- Chosen version:
-- Already present before work started: yes / no
-- Installed during bootstrap:
+- Chosen version: `python3.11` / Python 3.11.2
+- Already present before work started: yes
+- Installed during bootstrap: no new host Python package installed; reused existing system `python3.11`
 
 ### Host OS packages added
 
-- 
+- none so far
+- pre-existing helpers observed on host: `google-chrome`, `xdg-open`, `xvfb-run`
+- pre-install manual package baseline saved to `.local/work/host-manual-packages.before.txt`
 
 ### Python packages installed in `.venv`
 
-- 
+- upgraded bootstrap tooling: `pip`, `setuptools`, `wheel`
+- installed editable package: `-e .[browser]`
+- key installed runtime deps: `playwright`, `click`, `httpx`, `rich`
+- full freeze saved to `.local/work/bootstrap-venv-freeze.txt`
 
 ### Browser / Playwright artifacts added
 
-- Chromium installed via Playwright: yes / no
-- Playwright cache path:
-- Browser profile path:
+- Chromium installed via Playwright: yes
+- Playwright cache path: `/home/vgoro/n8n-install/notebooklm-py/.local/ms-playwright`
+- Browser profile path: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home/profiles/default/browser_profile`
 
 ### NotebookLM auth artifacts
 
 - `NOTEBOOKLM_HOME` used: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home`
-- `storage_state.json` path:
-- extra profiles used:
+- `storage_state.json` path: `/home/vgoro/n8n-install/notebooklm-py/.local/notebooklm-home/profiles/default/storage_state.json` (currently absent)
+- extra profiles used: none
 
 ### Cleanup candidates after Docker migration
 
 - `/home/vgoro/n8n-install/notebooklm-py/.venv`
 - host-only Playwright/browser payloads
 - host OS packages added only for Stage 1
+
+## Current bootstrap status
+
+- repo bootstrap is green up to package install and Playwright browser download
+- `notebooklm --version` works (`0.3.4`)
+- `notebooklm doctor --fix` succeeded for profile-dir creation
+- remaining blocker is authentication: `auth check` reports missing `storage_state.json`
+- no existing browser cookie DB or prior NotebookLM auth state was found under `/home/vgoro`

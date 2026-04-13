@@ -11,7 +11,7 @@ Purpose: track everything added on the host for Stage 1, so it can be cleaned up
 
 ## Repo metadata
 
-- Fork remote URL:
+- Fork remote URL: `https://github.com/Contentceh/notebooklm-py.git`
 - Upstream remote URL: `https://github.com/teng-lin/notebooklm-py`
 - Branch used:
 

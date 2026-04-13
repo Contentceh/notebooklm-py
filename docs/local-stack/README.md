@@ -5,6 +5,7 @@
 - Preferred clone path: `/home/vgoro/n8n-install/notebooklm-py/`
 - We will work from that folder directly.
 - Repo-specific notes should also live **inside that fork**, not in a separate top-level docs area.
+- Org policy: stack-owned repos should use the `Contentceh` organization as `origin` when applicable.
 - Stage 1 is still done **without Docker**.
 - Docker is Stage 2, after host-side login/auth/smoke test succeed.
 
@@ -14,7 +15,7 @@
 
 - Fork clone path: `/home/vgoro/n8n-install/notebooklm-py`
 - Expected upstream base: `teng-lin/notebooklm-py`
-- Actual fork remote: **TBD**
+- Actual fork remote: `https://github.com/Contentceh/notebooklm-py.git`
 
 ### Local runtime paths inside the repo folder
 

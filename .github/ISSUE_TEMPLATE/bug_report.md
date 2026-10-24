@@ -34,6 +34,8 @@ Paste error output here
 - Python version: (e.g., 3.12)
 - notebooklm-py version: (run `notebooklm --version`)
 - Install method: (pip, uv, pipx)
+- Surface: (CLI, Python API, MCP, REST server, desktop extension, docs)
+- Backend: (web, android, not applicable/unknown)
 
 ## Debug Output
 
@@ -42,6 +44,19 @@ If applicable, run the failing command with `-vv` for verbose logging and paste 
 ```bash
 notebooklm -vv <your-command-here>
 ```
+
+For auth/context issues, also include these outputs with cookies, emails, notebook
+titles, and paths redacted as needed:
+
+```bash
+notebooklm doctor --json
+notebooklm status --paths --json
+notebooklm auth check --test --json
+```
+
+If the issue is backend-specific, put `--backend web` or `--backend android`
+before the command and include that in the report. Redact cookies, tokens,
+email addresses, notebook IDs, and local paths before pasting output.
 
 ## Checklist
 

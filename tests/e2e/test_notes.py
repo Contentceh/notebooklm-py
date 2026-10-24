@@ -2,7 +2,10 @@
 
 import pytest
 
-from .conftest import requires_auth
+from notebooklm import NoteNotFoundError
+from notebooklm._env import get_base_url
+
+from .conftest import requires_auth, skip_or_fail_missing_reference
 
 
 @requires_auth
@@ -27,7 +30,7 @@ class TestNotesGet:
         """Get a specific note from test notebook - read-only."""
         notes = await client.notes.list(read_only_notebook_id)
         if not notes:
-            pytest.skip("No notes available in test notebook")
+            skip_or_fail_missing_reference("No notes available in test notebook")
 
         note = await client.notes.get(read_only_notebook_id, notes[0].id)
         assert note is not None
@@ -35,9 +38,10 @@ class TestNotesGet:
 
     @pytest.mark.asyncio
     async def test_get_note_not_found(self, client, read_only_notebook_id):
-        """Test getting a non-existent note returns None."""
-        note = await client.notes.get(read_only_notebook_id, "nonexistent_note_id")
-        assert note is None
+        """Test getting a non-existent note raises NoteNotFoundError."""
+        # v0.8.0: a miss now raises NoteNotFoundError (issue #1247).
+        with pytest.raises(NoteNotFoundError):
+            await client.notes.get(read_only_notebook_id, "nonexistent_note_id")
 
 
 @requires_auth
@@ -63,9 +67,9 @@ class TestNotesCRUD:
         note_ids = [n.id for n in notes]
         assert note.id in note_ids
 
-        # Delete
+        # Delete (v0.7.0: returns None, idempotent — issue #1211)
         result = await client.notes.delete(temp_notebook.id, note.id)
-        assert result is True
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_update_note(self, client, temp_notebook):
@@ -105,3 +109,58 @@ class TestMindMaps:
         """List mind maps in test notebook - read-only."""
         mind_maps = await client.notes.list_mind_maps(read_only_notebook_id)
         assert isinstance(mind_maps, list)
+
+
+@pytest.mark.e2e
+@requires_auth
+class TestSaveAnswerAsNote:
+    """Test saving chat answers as citation-rich notes (issue #660).
+
+    These tests exercise the full ask → save_answer_as_note path against
+    the live NotebookLM service. The note's creation success is
+    automated; the per-citation hover-anchor rendering is a MANUAL
+    verification step — open the resulting note in the web UI, hover a
+    ``[N]`` marker, and confirm a passage popup appears. The test
+    prints instructions to the log to make this step actionable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_save_answer_as_note_preserves_citations(self, client, temp_notebook):
+        """Ask a citation-bearing question, save as note, verify creation.
+
+        Uses ``temp_notebook`` so the test cleans up after itself even
+        when a downstream assertion fails. The actual hover-anchor
+        check is manual — see class docstring.
+        """
+        result = await client.chat.ask(
+            temp_notebook.id,
+            "Summarize the key points from the sources in one sentence.",
+        )
+        if not result.references:
+            pytest.skip(
+                "Live answer had no citations; save_answer_as_note requires "
+                "non-empty references. Temp notebook may need sources."
+            )
+
+        note = await client.chat.save_answer_as_note(
+            temp_notebook.id,
+            result,
+            title=f"E2E #660 hover-anchor test {result.conversation_id[:8]}",
+        )
+        try:
+            assert note.id != ""
+            # The server may apply smart-title generation for [2]-mode
+            # notes — assert non-empty but don't pin the value.
+            assert note.title
+
+            listed = await client.notes.list(temp_notebook.id)
+            assert note.id in {n.id for n in listed}
+
+            print(
+                f"\n[Manual hover-anchor check] Open "
+                f"{get_base_url()}/notebook/{temp_notebook.id}, "
+                f"find note '{note.title}' (id={note.id[:8]}...), hover any "
+                f"[N] marker, confirm the popup shows the cited passage."
+            )
+        finally:
+            await client.notes.delete(temp_notebook.id, note.id)

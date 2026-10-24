@@ -1,120 +1,59 @@
-"""User settings API."""
+"""Backend-neutral user-settings namespace contract."""
 
-import logging
-from collections.abc import Sequence
+import contextlib
+from abc import ABC, abstractmethod
 
-from ._core import ClientCore
-from .rpc import RPCMethod
-
-logger = logging.getLogger(__name__)
-
-
-def _extract_nested_value(data: list | None, path: Sequence[int]) -> str | None:
-    """Extract a value from nested lists by following an index path.
-
-    Args:
-        data: The nested list structure to extract from.
-        path: Sequence of indices to follow (e.g., [2, 4, 0] for data[2][4][0]).
-
-    Returns:
-        The extracted string value, or None if the path is invalid or value is empty.
-    """
-    try:
-        result = data
-        for idx in path:
-            result = result[idx]  # type: ignore[index]
-        return result or None  # type: ignore[return-value]
-    except (TypeError, IndexError):
-        return None
+from ._runtime.call_supervisor import OperationLease
+from ._usage import RawUsageSummary, UsageAccount, decode_usage_summary
+from .types import AccountLimits, UsageSummary, UsageSummaryStatus, UserSettings
 
 
-class SettingsAPI:
-    """Operations on NotebookLM user settings.
+class SettingsAPI(ABC):
+    """Operations on NotebookLM user settings."""
 
-    Provides methods for managing global user settings like output language.
+    @abstractmethod
+    def _operation_scope(
+        self, label: str
+    ) -> contextlib.AbstractAsyncContextManager[OperationLease | None]:
+        """Return the backend's scope for one multi-call workflow."""
+        raise NotImplementedError
 
-    Usage:
-        async with NotebookLMClient.from_storage() as client:
-            lang = await client.settings.get_output_language()
-            await client.settings.set_output_language("zh_Hans")
-    """
-
-    # Response paths for extracting language code from different RPC responses
-    _SET_LANGUAGE_PATH = (2, 4, 0)  # result[2][4][0]
-    _GET_SETTINGS_PATH = (0, 2, 4, 0)  # result[0][2][4][0]
-
-    def __init__(self, core: ClientCore) -> None:
-        """Initialize the settings API.
-
-        Args:
-            core: The core client infrastructure.
-        """
-        self._core = core
-
+    @abstractmethod
     async def set_output_language(self, language: str) -> str | None:
-        """Set the output language for artifact generation.
+        """Set the account's output language."""
 
-        This is a global setting that affects all notebooks in your account.
+    @abstractmethod
+    async def get_user_settings(self) -> UserSettings:
+        """Fetch account limits and output language in one request."""
 
-        Note: Use get_output_language() to read the current setting.
-        Empty strings are rejected (they would reset to default, not read current).
-
-        Args:
-            language: Language code (e.g., "en", "zh_Hans", "ja").
-                     Must be a non-empty valid language code.
-
-        Returns:
-            The language that was set, or None if the response couldn't be parsed.
-        """
-        if not language:
-            logger.warning(
-                "Empty string not supported - use get_output_language() to read the current setting. "
-                "Passing empty string to the API would reset the language to default, not read it."
-            )
-            return None
-
-        logger.debug("Setting output language: %s", language)
-
-        # Params structure: [[[null,[[null,null,null,null,["language_code"]]]]]]
-        params = [[[None, [[None, None, None, None, [language]]]]]]
-
-        result = await self._core.rpc_call(
-            RPCMethod.SET_USER_SETTINGS,
-            params,
-            source_path="/",
-        )
-
-        current_language = _extract_nested_value(result, self._SET_LANGUAGE_PATH)
-        self._log_language_result(current_language, "Output language is now")
-        return current_language
-
+    @abstractmethod
     async def get_output_language(self) -> str | None:
-        """Get the current output language setting.
+        """Fetch the current output language in its own request."""
 
-        Fetches user settings from the server and extracts the language code.
+    @abstractmethod
+    async def get_account_limits(self) -> AccountLimits:
+        """Fetch account limits in their own request."""
 
-        Returns:
-            The current language code (e.g., "en", "ja", "zh_Hans"),
-            or None if not set or couldn't be parsed.
+    async def get_usage(self) -> UsageSummary:
+        """Fetch the live compute-meter snapshot when the account enables it.
+
+        The account-owned eligibility bit is authoritative.  A disabled account
+        avoids the quota-summary RPC entirely; eligible accounts delegate
+        response validation and public projection to the neutral decoder.
         """
-        logger.debug("Fetching user settings to get output language")
+        async with self._operation_scope("settings.get_usage") as lease:
+            account = await self._get_usage_account(lease=lease)
+            if not account.compute_metering_enabled:
+                return UsageSummary(status=UsageSummaryStatus.DISABLED)
+            return decode_usage_summary(await self._list_quota_summary(lease=lease))
 
-        # Params structure: [null,[1,null,null,null,null,null,null,null,null,null,[1]]]
-        params = [None, [1, None, None, None, None, None, None, None, None, None, [1]]]
+    @abstractmethod
+    async def _get_usage_account(self, *, lease: OperationLease | None) -> UsageAccount:
+        """Read the account meter-eligibility bit for :meth:`get_usage`."""
 
-        result = await self._core.rpc_call(
-            RPCMethod.GET_USER_SETTINGS,
-            params,
-            source_path="/",
-        )
+    @abstractmethod
+    async def _list_quota_summary(self, *, lease: OperationLease | None) -> RawUsageSummary:
+        """Read a presence-aware decoded ``ListQuotaSummary`` response."""
 
-        current_language = _extract_nested_value(result, self._GET_SETTINGS_PATH)
-        self._log_language_result(current_language, "Current output language")
-        return current_language
 
-    def _log_language_result(self, language: str | None, success_prefix: str) -> None:
-        """Log the result of a language operation."""
-        if language:
-            logger.debug("%s: %s", success_prefix, language)
-        else:
-            logger.debug("Could not parse language from response")
+__all__ = ["SettingsAPI"]

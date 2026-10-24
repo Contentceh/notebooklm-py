@@ -5,19 +5,47 @@
 ### Getting Started
 
 ```bash
-# Install in development mode
-pip install -e ".[all]"
-playwright install chromium
-
-# Run tests
-pytest
-
-# Run linter
-ruff check src/ tests/
-
-# Run formatter
-ruff format src/ tests/
+# Canonical contributor install (respects uv.lock)
+uv sync --frozen --extra browser --extra dev --extra markdown
+source .venv/bin/activate
+uv run playwright install chromium
+pre-commit install
 ```
+
+**Run the full pre-commit suite** (matches what CI runs). IMPORTANT: use the
+broad `.` scope, not `src/ tests/` — the pre-commit hook in CI invokes
+ruff-format on the whole tree and is stricter than a narrow scope.
+
+```bash
+uv run ruff format --check . && \
+    uv run ruff check . && \
+    uv run mypy src/notebooklm --ignore-missing-imports && \
+    uv run pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90
+```
+
+**No uv?** Plain pip works as a fallback (won't enforce the lockfile, so you may resolve newer dep versions than CI):
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[all]"   # [all] = browser + dev + markdown + mcp + server (no cookies; see installation.md)
+playwright install chromium
+pre-commit install
+```
+
+For full prerequisites, headless setup, optional extras (`[android]`, `[cookies]`, `[markdown]`, `[mcp]`, `[server]`), and platform notes, see [docs/installation.md#e-contributor](docs/installation.md#e-contributor).
+
+> **Install-doc parity.** `docs/installation.md` is the canonical install guide; this file mirrors a small contributor-focused subset. Every fenced ``bash`` block in `installation.md` must EITHER appear verbatim in `CONTRIBUTING.md`, OR be marked with `<!-- not mirrored: <reason> -->` on the line directly before its opening fence. CI enforces this via `scripts/check_ci_install_parity.py` so a stale block can't drift in unnoticed. When you edit `installation.md`, decide on the spot whether the new content also belongs in this file.
+
+The `browser` extra is part of the contributor install because the default unit
+suite imports and patches `playwright.sync_api`. The command
+`uv sync --frozen --extra dev` is only the test/lint toolchain; it is not enough
+for `uv run pytest`.
+
+Android runtime work is opt-in. Add `--extra android` to the canonical
+contributor sync command when running Android tests or regenerating Android
+stubs; keep the existing `browser`, `dev`, and `markdown` extras. The `all`
+extra does not include the Android runtime.
+
+> **Architecture & testing context.** Once installed, read [docs/development.md](docs/development.md) for the layered architecture (Adapters, App Core, Client, Runtime, Backends), test-tree layout, and release workflow before touching `src/notebooklm/`.
 
 ### Code Quality
 
@@ -25,31 +53,35 @@ This project uses **ruff** for linting and formatting:
 
 ```bash
 # Check for lint issues
-ruff check src/ tests/
+ruff check .
 
 # Auto-fix lint issues
-ruff check --fix src/ tests/
+ruff check --fix .
 
 # Check formatting
-ruff format --check src/ tests/
+ruff format --check .
 
 # Apply formatting
-ruff format src/ tests/
+ruff format .
 ```
 
-**Pre-commit hooks** (optional but recommended):
+**Pre-commit hooks** (included in the `[dev]` extra; install once after the canonical setup):
 ```bash
-pip install pre-commit
-pre-commit install
+pre-commit install                              # one-time, after the canonical install
+pre-commit run --all-files                      # manual run on the whole tree (matches the CI lint gate)
 ```
+
+> **Caveat:** if `pre-commit install` errors with `Cowardly refusing to install hooks with core.hooksPath set`, your git is configured to use a custom hooks directory (common with Husky / nx / shared dev configs). Workaround: `git config --unset core.hooksPath` then re-run `pre-commit install`, or run `pre-commit run --all-files` manually before each commit. CI runs the same hook either way, so a clean local hook is convenience, not correctness.
+
+> **CI parity.** Running `pre-commit run --all-files` matches the CI **lint gate** (`uv run pre-commit run --all-files` in `.github/workflows/test.yml`). CI additionally runs a reduced 5-cell compatibility matrix on every PR — Python 3.10, 3.12, and 3.15 on Ubuntu plus Python 3.12 on macOS and Windows — without coverage. The separate **Nightly Code Checks** workflow (`nightly-checks.yml`) runs the full 18-cell matrix (all three OSes across Python 3.10–3.15) and the 90% coverage floor (`pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90`); **Nightly E2E Tests** (`nightly.yml`) runs authenticated live lanes. Local tests cover only the extras you installed: MCP and REST adapter suites skip when the `mcp` and `server` extras are absent. Cross-OS and multi-Python-version drift also remains CI-only — `uv run pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90` here uses only your local OS and Python version.
 
 ### Pull Request Process
 
 1. Create a feature branch from `main`
 2. Make your changes with clear commit messages
 3. Ensure tests pass: `pytest`
-4. Ensure lint passes: `ruff check src/ tests/`
-5. Ensure formatting: `ruff format --check src/ tests/`
+4. Ensure lint passes: `ruff check .`
+5. Ensure formatting: `ruff format --check .`
 6. Submit a PR with a description of changes
 
 ### Pull Request Quality Expectations
@@ -59,6 +91,80 @@ pre-commit install
 - **No duplicates**: Check existing open PRs before submitting. Duplicate PRs for the same issue will be closed in favor of the first or best submission.
 - **Accurate severity**: Claims of "critical" bugs must include evidence (stack trace, reproduction steps, affected users). Routine edge cases are not critical.
 - **Tested locally**: All PRs must include evidence of local testing. The PR template includes a checklist for this.
+
+### Dependency upper bounds
+
+Every runtime and `[project.optional-dependencies]` entry in `pyproject.toml` must have an upper bound — typically `<currentmajor + 1` (or `<currentminor + 1` for pre-1.0 packages like `httpx`). The bound protects downstream installs from a breaking new release that lands before we have time to test it.
+
+When you bump a cap (e.g. moving `pytest>=8.0,<10` to `pytest>=8.0,<11`):
+
+1. Run `uv lock --refresh` and `uv sync --frozen --extra browser --extra dev --extra markdown` locally.
+2. Run the full pre-commit one-liner above.
+3. Mention the upgrade rationale in the PR description.
+
+The `dependency-audit` workflow (`.github/workflows/dependency-audit.yml`) runs `pip-audit --strict --require-hashes` against the locked env on every push to `main` and nightly. It is a **hard gate** (no `continue-on-error`): a CVE in the locked environment fails the workflow. New deps must pass `pip-audit` cleanly when introduced; pin a fixed version or record a tracked exception via `pip-audit`'s `--ignore-vuln` if no fix is yet available.
+
+### Test tiers
+
+The test suite is split into three tiers by network/auth dependency. Place new tests in the tier that matches their isolation profile — a tier-enforcement hook will eventually fail PRs that mis-tier a test.
+
+| Tier | Location | What lives here | Network | Auth |
+|------|----------|-----------------|---------|------|
+| Unit | `tests/unit/` | Pure-Python tests + `pytest_httpx` (`httpx_mock`) request-level mocks. Encoder/decoder, dataclasses, helpers, CLI boundary, and httpx_mock-driven API tests. | None (mocked) | None |
+| Integration | `tests/integration/` | VCR cassette replay only — `@pytest.mark.vcr` / `notebooklm_vcr.use_cassette(...)` against recorded fixtures in `tests/cassettes/web/`. | None (replayed) | None |
+| E2E | `tests/e2e/` | Real NotebookLM API. Marked `@pytest.mark.e2e`; excluded from the default `pytest` run via `addopts = --ignore=tests/e2e`. | Real | Required (`notebooklm login`) |
+
+Run a tier explicitly:
+
+```bash
+uv run pytest tests/unit
+uv run pytest tests/integration
+uv run pytest tests/e2e -m e2e        # requires auth
+```
+
+#### Fast local loop (skip repo-wide audit checks)
+
+A subset of unit tests are repo-wide audit / release-gate checks (cassette
+shape lint, public-surface scans, CI-script audits, doc-sync guards) that scan
+many files and add ~30–45s to the local `tests/unit tests/integration` loop.
+They're marked `@pytest.mark.repo_lint` so you can opt out while iterating:
+
+```bash
+# Fast feedback loop — drops repo_lint audits and exhaustive refactor qualification.
+uv run pytest tests/unit tests/integration -m "not repo_lint and not refactor_qualification"
+
+# Run only the repo_lint audits (what you'd typically skip above).
+uv run pytest tests/unit tests/integration -m "repo_lint"
+```
+
+Run the full routine suite (including `repo_lint`, excluding
+`refactor_qualification`) before pushing. PR CI does **not** run `repo_lint` in
+bulk: every matrix cell excludes both slower markers, so of `repo_lint` itself
+only the guards named by node id in the `Run critical contract guards` step of
+`.github/workflows/test.yml` are merge-blocking (the ordinary suite blocks merge
+as always, and the Code Quality job independently runs some of the same scripts
+several `repo_lint` tests wrap).
+The rest of the marker runs in the manual `repo-lint` job (`workflow_dispatch`)
+and nightly, so a `repo_lint` failure with no promoted node id and no
+Code-Quality mirror can reach `main` unnoticed until the next nightly. The
+default `uv run pytest` invocation does not filter the marker out; `make gates`
+runs the marker with CI's shape.
+
+Exhaustive concurrency wave matrices and migration-only inventories use the
+`refactor_qualification` marker. Routine PR CI excludes this marker while keeping
+compact public-contract and boundary guards merge-blocking. Run it explicitly
+when validating a refactor; manual CI, nightly qualification on every supported
+Python, and the PyPI/TestPyPI release smoke also run it:
+
+```bash
+uv run pytest -m refactor_qualification --timeout=180 --no-cov
+```
+
+Quick guidance:
+
+- Reach for `httpx_mock` when you need to assert on outgoing request shape (headers, body, cookies, URL) or stub a small response — put the test under `tests/unit/`.
+- Reach for VCR when you want to replay a recorded server response end-to-end against the real RPC decoder — put the test under `tests/integration/` and record the cassette per `docs/rpc-development.md`.
+- Reach for E2E only when you need to validate a live round-trip against Google's servers — put the test under `tests/e2e/` and mark it `@pytest.mark.e2e`.
 
 ---
 
@@ -91,8 +197,9 @@ Content that should not be changed by agents...
 For code files:
 ```python
 # PROTECTED: Do not modify without approval
-class RPCMethod(Enum):
-    ...
+class RPCMethod(Enum): ...
+
+
 # END PROTECTED
 ```
 
@@ -119,7 +226,7 @@ Design decisions should be captured where they're most useful, not in separate d
 |------|--------|---------|
 | Root GitHub files | `UPPERCASE.md` | `README.md`, `CONTRIBUTING.md` |
 | Agent files | `UPPERCASE.md` | `CLAUDE.md`, `AGENTS.md` |
-| Subfolder README | `README.md` | `docs/examples/README.md` |
+| Subfolder README | `README.md` | `docs/adr/README.md` |
 | All other docs/ files | `lowercase-kebab.md` | `cli-reference.md`, `contributing.md` |
 | Scratch files | `YYYY-MM-DD-context.md` | `2026-01-06-debug-auth.md` |
 
@@ -138,7 +245,7 @@ Agents should ignore files marked `Deprecated`.
 
 1. **Link, Don't Copy** - Reference README.md sections instead of repeating commands. Prevents drift between docs.
 
-2. **Scoped Instructions** - Subfolders like `docs/examples/` may have their own README.md with folder-specific rules.
+2. **Scoped Instructions** - Subfolders like `examples/` may have their own README.md with folder-specific rules.
 
 ---
 
@@ -146,14 +253,25 @@ Agents should ignore files marked `Deprecated`.
 
 ```
 docs/
+├── adr/                   # Architectural Decision Records (ADRs)
+├── architecture.md        # Layered architecture and repository map
+├── cli-exit-codes.md      # CLI exit-code convention (binding contract for scripts/CI)
 ├── cli-reference.md       # CLI command reference
+├── configuration.md       # Storage, profiles, and settings
+├── deprecations.md        # Staged API deprecations tracker
+├── development.md         # Architecture, testing, and VCR cassette practices
+├── installation.md        # Canonical install guide (personas, extras, platform notes)
+├── mcp-guide.md           # MCP server setup, tools, and troubleshooting
 ├── python-api.md          # Python API reference
-├── configuration.md       # Storage and settings
-├── troubleshooting.md     # Common issues and solutions
-├── stability.md           # API versioning policy
-├── development.md         # Architecture and testing
+├── web-android-public-behavior.md  # Classified remaining public Web vs Android splits
+├── refactor-history.md    # Historical record of the Tier 12/13 refactor + downstream migration tables
 ├── releasing.md           # Release checklist
 ├── rpc-development.md     # RPC capture and debugging
-├── rpc-reference.md       # RPC payload structures
-└── examples/              # Runnable example scripts
+├── rpc-reference.md       # RPC payload structures and Content Type Codes
+├── stability.md           # API versioning and stability policy
+└── troubleshooting.md     # Common issues and solutions
 ```
+
+Runnable example scripts live at the repository root under `examples/`.
+
+> When adding or modifying a CLI command, follow the [CLI Exit-Code Convention](docs/cli-exit-codes.md) — the policy table and the two intentional exceptions (`source stale`, `source wait`) are binding.

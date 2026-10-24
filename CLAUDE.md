@@ -1,234 +1,99 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-**IMPORTANT:** Follow documentation rules in [CONTRIBUTING.md](CONTRIBUTING.md) - especially the file creation and naming conventions.
+Guidance for Claude Code working in this repository. Follow conventions in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Project Overview
 
-`notebooklm-py` is an unofficial Python client for Google NotebookLM that uses undocumented RPC APIs. The library enables programmatic automation of NotebookLM features including notebook management, source integration, AI querying, and studio artifact generation (podcasts, videos, quizzes, etc.).
+`notebooklm-py` is an unofficial **async** Python client for Google NotebookLM, driving Google's internal `batchexecute` RPC protocol to automate notebooks, sources, chat, and studio artifacts.
 
-**Critical constraint**: This uses Google's internal `batchexecute` RPC protocol with obfuscated method IDs that Google can change at any time. All RPC method IDs in `src/notebooklm/rpc/types.py` are undocumented and subject to breakage.
+**Critical constraint:** Obfuscated RPC method IDs in `src/notebooklm/rpc/_identifiers.py` are undocumented and Google changes them periodically — the #1 breakage class. `rpc/types.py` re-exports them for backwards compatibility.
 
 ## Development Commands
 
-```bash
-# Create/recreate venv with uv (recommended - relocatable venvs)
-uv venv .venv
-uv pip install -e ".[all]"
-playwright install chromium
+See [docs/installation.md](docs/installation.md) for the full installation guide.
 
-# Activate virtual environment
+```bash
+# Contributor install (matches CI test jobs):
+uv sync --frozen --extra browser --extra dev --extra markdown \
+        --extra mcp --extra server --extra impersonate
 source .venv/bin/activate
+uv run playwright install chromium
 
-# Run all tests (excluding e2e by default)
-pytest
-
-# Run with coverage
-pytest --cov
-
-# Run e2e tests (requires authentication)
-pytest tests/e2e -m e2e
-
-# CLI testing
-notebooklm --help
+uv run pytest                     # all tests (e2e excluded by default)
+uv run pytest --cov               # with coverage
+uv run pytest tests/e2e -m e2e    # e2e (requires auth)
+uv run notebooklm --help          # CLI
 ```
 
-## Pre-Commit Checks (REQUIRED before committing)
-
-**IMPORTANT:** Always run these checks before committing to avoid CI failures:
+Always install the full extras set (`mcp`, `server`, `impersonate`); omitting them causes adapter suites to skip silently, masking errors and failing the 90% coverage threshold.
 
 ```bash
-# Format code with ruff
-ruff format src/ tests/
-
-# Check for linting issues
-ruff check src/ tests/
-
-# Type checking with mypy
-mypy src/notebooklm --ignore-missing-imports
-
-# Run tests
-pytest
+# Approximate nightly coverage gate:
+uv run pytest -n auto --dist loadgroup --cov=src/notebooklm \
+  --cov-report=term-missing --cov-fail-under=90
 ```
 
-Or use this one-liner:
+`--dist loadgroup` is required to honor `@pytest.mark.xdist_group`. Avoid piping test commands into `tail`/`grep` to prevent masking non-zero exit codes.
+
+## Before Pushing
+
+CI enforces formatting, linting, type checks, and tests:
+
 ```bash
-ruff format src/ tests/ && ruff check src/ tests/ && mypy src/notebooklm --ignore-missing-imports && pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/notebooklm scripts/_live_auth_scenarios --ignore-missing-imports
+uv run pytest
 ```
 
 ## Architecture
 
-### Layered Design
+Adapters (`cli/`, `mcp/`, `server/`) → `_app/` (business logic) → `client.py` + `_runtime/` → selected backend (`_web/` or `_android/`) → `raw.py` (`rpc/` is Web compatibility facade).
 
-```
-CLI Layer (cli/)
-    ↓
-Client Layer (client.py, _*.py APIs)
-    ↓
-Core Layer (_core.py)
-    ↓
-RPC Layer (rpc/)
-```
-
-1. **RPC Layer** (`src/notebooklm/rpc/`):
-   - `types.py`: All RPC method IDs and enums (source of truth)
-   - `encoder.py`: Request encoding
-   - `decoder.py`: Response parsing
-
-2. **Core Layer** (`src/notebooklm/_core.py`):
-   - HTTP client management
-   - RPC call abstraction
-   - Request counter handling
-
-3. **Client Layer** (`src/notebooklm/client.py`, `_*.py`):
-   - `NotebookLMClient`: Main async client with namespaced APIs
-   - `_notebooks.py`, `_sources.py`, `_artifacts.py`, etc.: Domain APIs
-
-4. **CLI Layer** (`src/notebooklm/cli/`):
-   - Modular Click commands
-   - `session.py`, `notebook.py`, `source.py`, `generate.py`, etc.
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `client.py` | Main `NotebookLMClient` class |
-| `_core.py` | HTTP and RPC infrastructure |
-| `_notebooks.py` | `client.notebooks` API |
-| `_sources.py` | `client.sources` API |
-| `_artifacts.py` | `client.artifacts` API |
-| `_chat.py` | `client.chat` API |
-| `rpc/types.py` | RPC method IDs (source of truth) |
-| `auth.py` | Authentication handling |
-| `cli/` | CLI command modules |
-
-### Repository Structure
-
-```
-src/notebooklm/
-├── __init__.py          # Public exports
-├── client.py            # NotebookLMClient
-├── auth.py              # Authentication
-├── types.py             # Dataclasses
-├── _core.py             # Core infrastructure
-├── _notebooks.py        # NotebooksAPI
-├── _sources.py          # SourcesAPI
-├── _artifacts.py        # ArtifactsAPI
-├── _chat.py             # ChatAPI
-├── _research.py         # ResearchAPI
-├── _notes.py            # NotesAPI
-├── rpc/                 # RPC protocol layer
-│   ├── types.py         # Method IDs and enums
-│   ├── encoder.py       # Request encoding
-│   └── decoder.py       # Response parsing
-└── cli/                 # CLI implementation
-    ├── __init__.py
-    ├── helpers.py       # Shared utilities
-    ├── session.py       # login, use, status, clear
-    ├── notebook.py      # list, create, delete, rename
-    ├── source.py        # source add, list, delete
-    ├── artifact.py      # artifact commands
-    ├── generate.py      # generate audio, video, etc.
-    ├── download.py      # download commands
-    ├── chat.py          # ask, configure, history
-    └── note.py          # note commands
-```
-
-## API Patterns
-
-### Client Usage
-
-```python
-# Correct pattern - uses namespaced APIs
-async with await NotebookLMClient.from_storage() as client:
-    notebooks = await client.notebooks.list()
-    await client.sources.add_url(nb_id, url)
-    result = await client.chat.ask(nb_id, question)
-    status = await client.artifacts.generate_audio(nb_id)
-```
-
-### CLI Structure
-
-Commands are organized as:
-- **Top-level**: `login`, `use`, `status`, `clear`, `list`, `create`, `ask`
-- **Grouped**: `source add`, `artifact list`, `generate audio`, `download video`, `note create`
-
-## Testing Strategy
-
-- **Unit tests** (`tests/unit/`): Test encoding/decoding, no network
-- **Integration tests** (`tests/integration/`): Mock HTTP responses
-- **E2E tests** (`tests/e2e/`): Real API, require auth, marked `@pytest.mark.e2e`
-
-### E2E Test Status
-
-- ✅ Notebook operations (list, create, rename, delete)
-- ✅ Source operations (add URL/text/YouTube, rename)
-- ✅ Download operations (audio, video, infographic, slides)
-- ⚠️ Artifact generation may fail due to rate limiting
+See [docs/architecture.md](docs/architecture.md) for layered design, call flows, cross-cutting policies (loop affinity, idempotency, schema validation), and the full file map.
 
 ## Common Pitfalls
 
-1. **RPC method IDs change**: Check network traffic and update `rpc/types.py`
-2. **Nested list structures**: Params are position-sensitive. Check existing implementations.
-3. **Source ID nesting**: Different methods need `[id]`, `[[id]]`, `[[[id]]]`, or `[[[[id]]]]`
-4. **CSRF tokens expire**: Use `client.refresh_auth()` or re-run `notebooklm login`
-5. **Rate limiting**: Add delays between bulk operations
+1. **RPC method IDs change** — re-capture network traffic and update `rpc/_identifiers.py`.
+2. **Position-sensitive nested params** — mirror existing shapes; source-id nesting varies (`[id]` / `[[id]]` / `[[[id]]]` / `[[[[id]]]]`).
+3. **CSRF tokens expire** — call `client.refresh_auth()` or re-run `notebooklm login`.
+4. **Rate limiting** — add delays between bulk operations.
+5. **Concurrency** — one `NotebookLMClient` is bound to its `open()` event loop: one per thread, never reuse across loops or `AuthTokens` tenants (see [concurrency contract](docs/python-api.md#concurrency-contract)).
 
-## Documentation
+## Usage
 
-All docs use lowercase-kebab naming in `docs/`:
-- `docs/cli-reference.md` - CLI commands
-- `docs/python-api.md` - Python API reference
-- `docs/configuration.md` - Storage and settings
-- `docs/troubleshooting.md` - Known issues
-- `docs/development.md` - Architecture, testing, releasing
-- `docs/rpc-development.md` - RPC capture and debugging
-- `docs/rpc-reference.md` - RPC payload structures
-
-## When to Suggest CLI vs API
-
-- **CLI**: Quick tasks, shell scripts, LLM agent automation
-- **Python API**: Application integration, complex workflows, async operations
-
-## Pull Request Workflow (REQUIRED)
-
-After creating a PR, you MUST monitor and address feedback:
-
-### 1. Monitor CI Status
-```bash
-# Check CI status (repeat until all pass)
-gh pr checks <PR_NUMBER>
+```python
+async with NotebookLMClient.from_storage() as client:
+    notebooks = await client.notebooks.list()
+    await client.sources.add_url(nb_id, url)
+    answer = await client.chat.ask(nb_id, question)
+    status = await client.artifacts.generate_audio(nb_id)
 ```
 
-Wait for all checks to pass. If any fail, investigate and fix.
+- **CLI:** Top-level commands (`login`, `use`, `status`, `list`, `ask`) and groups (`source`, `label`, `artifact`, `generate`, `download`, `note`, `mcp`, `research`). Reference: [docs/cli-reference.md](docs/cli-reference.md).
+- **MCP Server:** Console script `notebooklm-mcp` exposes `_app/` logic over MCP. Install with `notebooklm mcp install <client>`. Reference: [docs/mcp-guide.md](docs/mcp-guide.md).
+- **REST Server:** Console script `notebooklm-server` exposes `/v1` routes over `_app/`. Requires `NOTEBOOKLM_SERVER_TOKEN`. Reference: [docs/installation.md#rest-api-server](docs/installation.md#rest-api-server).
 
-### 2. Check for Review Comments
-```bash
-# Get review comments
-gh api repos/teng-lin/notebooklm-py/pulls/<PR_NUMBER>/comments \
-  --jq '.[] | "File: \(.path):\(.line)\nComment: \(.body)\n---"'
-```
+## Testing
 
-### 3. Address Feedback
-For each review comment (especially from `gemini-code-assist`):
-1. Read and understand the feedback
-2. Make the suggested fix if it improves the code
-3. Commit with a descriptive message referencing the feedback
-4. Push and re-check CI
-5. **Reply to the review thread** confirming the fix:
-   ```bash
-   gh api repos/teng-lin/notebooklm-py/pulls/<PR>/comments/<COMMENT_ID>/replies \
-     -f body="Addressed in commit <SHA>: <brief description>"
-   ```
+- **Unit:** `tests/unit/` (offline; includes `_app`, CLI, server, guardrails).
+- **Integration:** `tests/integration/` (VCR cassette replay matching method, scheme, host, port, path, rpcids, freq). Record with `NOTEBOOKLM_VCR_RECORD=1 uv run pytest tests/integration/ -v`.
+- **E2E:** `tests/e2e/` (real API, `@pytest.mark.e2e`, requires auth).
+- Details: [docs/development.md](docs/development.md).
 
-### 4. Verify Final State
-```bash
-# Ensure PR is ready to merge
-gh pr view <PR_NUMBER> --json state,mergeStateStatus,mergeable
-```
+## Documentation Map
 
-**Important**: Do NOT consider a PR complete until:
-- All CI checks pass
-- All review comments are addressed
-- `mergeStateStatus` is `CLEAN`
+Key references in `docs/`: [installation](docs/installation.md), [cli-reference](docs/cli-reference.md), [python-api](docs/python-api.md), [architecture](docs/architecture.md), [development](docs/development.md), [mcp-guide](docs/mcp-guide.md), [troubleshooting](docs/troubleshooting.md), and [adr/](docs/adr/).
+
+## Pull Request Workflow (required)
+
+Drive PRs to merge:
+
+1. Poll `gh pr checks <PR>` until all pass; investigate and fix any failures.
+2. Trigger Claude review by commenting `@claude review` on the PR.
+3. Address every review comment (`gemini-code-assist`, `coderabbitai`, `claude[bot]`): fix, push, reply on the thread (`Addressed in <SHA>: …`), and resolve threads.
+4. Merge only when all checks pass, all threads are resolved, and `mergeStateStatus` is `CLEAN`.
+
+**Note on `@claude review`:**
+- `claude[bot]` posts a sticky summary issue comment and inline diff comments (`gh api /repos/<owner>/<repo>/pulls/<PR>/comments`). It does not submit a formal GitHub `reviewDecision`, so check comments directly.
+- Ensure all inline `claude[bot]` review threads are addressed and resolved before merging.

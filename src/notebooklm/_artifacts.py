@@ -1,29 +1,44 @@
-"""Artifacts API for NotebookLM studio content.
+"""Backend-neutral artifact operations API."""
 
-Provides operations for generating, listing, downloading, and managing
-AI-generated artifacts including Audio Overviews, Video Overviews, Reports,
-Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
-"""
+from __future__ import annotations
 
-import asyncio
 import builtins
-import csv
-import html
-import json
+import contextlib
 import logging
-import re
-from pathlib import Path
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
-import httpx
-
-from ._core import ClientCore
-from .auth import load_httpx_cookies
-from .exceptions import ValidationError
-from .rpc import (
-    ArtifactStatus,
-    ArtifactTypeCode,
+from ._artifact import formatters as _artifact_formatters  # noqa: F401
+from ._artifact import polling as _artifact_polling  # noqa: F401
+from ._artifact import validation as _artifact_validation  # noqa: F401
+from ._artifact.creation import (
+    ArtifactCreationRequest,
+    AudioCreationRequest,
+    CinematicVideoCreationRequest,
+    DataTableCreationRequest,
+    FlashcardsCreationRequest,
+    InfographicCreationRequest,
+    QuizCreationRequest,
+    ReportCreationRequest,
+    SlideDeckCreationRequest,
+    VideoCreationRequest,
+)
+from ._artifact.creation_normalized import NormalizedArtifactCreationRequest
+from ._artifact.creation_policy import (
+    WEB_CREATION_POLICY,
+    normalize_creation,
+    normalize_video_prompt,
+)
+from ._artifact.downloads import AssetDownloadService, DownloadResult
+from ._artifact.polling import ArtifactPollingService
+from ._deprecation import warn_registered_deprecation
+from ._env import get_default_language
+from ._notebook_metadata import NotebookSourceIdProvider, reconcile_copy_mapping
+from ._polling_registry import PollRegistry
+from ._runtime.call_supervisor import OperationLease
+from ._types.enums import (
     AudioFormat,
     AudioLength,
     ExportType,
@@ -33,293 +48,265 @@ from .rpc import (
     QuizDifficulty,
     QuizQuantity,
     ReportFormat,
-    RPCError,
-    RPCMethod,
     SlideDeckFormat,
     SlideDeckLength,
     VideoFormat,
     VideoStyle,
-    artifact_status_to_str,
 )
+from ._types.research import MindMapResult
+from .exceptions import ArtifactNotFoundError, RPCError, ValidationError
 from .types import (
     Artifact,
-    ArtifactDownloadError,
-    ArtifactNotFoundError,
-    ArtifactNotReadyError,
-    ArtifactParseError,
+    ArtifactCreationCapability,
+    ArtifactCustomizationChoices,
+    ArtifactDownloadListing,
+    ArtifactDownloadRequest,
+    ArtifactDownloadSelection,
+    ArtifactListing,
+    ArtifactListingFailure,
+    ArtifactLookup,
+    ArtifactLookupStatus,
     ArtifactType,
+    CopiedArtifact,
     GenerationStatus,
     ReportSuggestion,
 )
 
+if TYPE_CHECKING:
+    from ._runtime.call_supervisor import CallSupervisor
+
 logger = logging.getLogger(__name__)
 
-# Media artifact types that require URL availability before reporting completion
-_MEDIA_ARTIFACT_TYPES = frozenset(
-    {
-        ArtifactTypeCode.AUDIO.value,
-        ArtifactTypeCode.VIDEO.value,
-        ArtifactTypeCode.INFOGRAPHIC.value,
-        ArtifactTypeCode.SLIDE_DECK.value,
-    }
-)
 
-if TYPE_CHECKING:
-    from ._notes import NotesAPI
+def _warn_ambiguous_artifact_absence() -> None:
+    """Emit the single registered warning for the legacy absence projection."""
+    warn_registered_deprecation("artifact_ambiguous_absence")
 
 
-def _extract_app_data(html_content: str) -> dict:
-    """Extract JSON from data-app-data HTML attribute.
-
-    The quiz/flashcard HTML embeds JSON in a data-app-data attribute
-    with HTML-encoded content (e.g., &quot; for quotes).
-    """
-    match = re.search(r'data-app-data="([^"]+)"', html_content)
-    if not match:
-        raise ArtifactParseError(
-            "quiz/flashcard",
-            details="No data-app-data attribute found in HTML",
-        )
-
-    encoded_json = match.group(1)
-    decoded_json = html.unescape(encoded_json)
-    return json.loads(decoded_json)
+def _incomplete_lookup_error(
+    failures: tuple[ArtifactListingFailure, ...],
+) -> RPCError:
+    """Project bounded aggregate-read evidence through the existing RPC error."""
+    components = ", ".join(sorted({failure.component.value for failure in failures}))
+    if not components:
+        components = "unspecified"
+    return RPCError(
+        f"Artifact lookup is incomplete; unavailable components: {components}",
+        method_id="artifacts.lookup",
+    )
 
 
-def _format_quiz_markdown(title: str, questions: list[dict]) -> str:
-    """Format quiz as markdown."""
-    lines = [f"# {title}", ""]
-    for i, q in enumerate(questions, 1):
-        lines.append(f"## Question {i}")
-        lines.append(q.get("question", ""))
-        lines.append("")
-        for opt in q.get("answerOptions", []):
-            marker = "[x]" if opt.get("isCorrect") else "[ ]"
-            lines.append(f"- {marker} {opt.get('text', '')}")
-        if q.get("hint"):
-            lines.append("")
-            lines.append(f"**Hint:** {q['hint']}")
-        lines.append("")
-    return "\n".join(lines)
+@dataclass(frozen=True)
+class _ArtifactCopyResult:
+    """Decoded copy mappings plus backend-specific failure diagnostics."""
+
+    items: builtins.list[CopiedArtifact]
+    method_id: str
+    malformed_count: int = 0
+    raw_response: str | None = None
 
 
-def _format_flashcards_markdown(title: str, cards: list[dict]) -> str:
-    """Format flashcards as markdown."""
-    lines = [f"# {title}", ""]
-    for i, card in enumerate(cards, 1):
-        front = card.get("f", "")
-        back = card.get("b", "")
-        lines.extend(
-            [
-                f"## Card {i}",
-                "",
-                f"**Q:** {front}",
-                "",
-                f"**A:** {back}",
-                "",
-                "---",
-                "",
-            ]
-        )
-    return "\n".join(lines)
+def __getattr__(name: str) -> Any:
+    """Resolve the legacy private ``_mind_map`` module alias lazily."""
+    if name == "_mind_map":
+        from ._web import mind_maps
+
+        return mind_maps
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _extract_cell_text(cell: Any) -> str:
-    """Recursively extract text from a nested cell structure.
-
-    Data table cells have deeply nested arrays with position markers (integers)
-    and text content (strings). This function traverses the structure and
-    concatenates all text fragments found.
-    """
-    if isinstance(cell, str):
-        return cell
-    if isinstance(cell, int):
-        return ""
-    if isinstance(cell, list):
-        return "".join(text for item in cell if (text := _extract_cell_text(item)))
-    return ""
-
-
-def _parse_data_table(raw_data: list) -> tuple[list[str], list[list[str]]]:
-    """Parse rich-text data table into headers and rows.
-
-    Data tables from NotebookLM have a complex nested structure with position
-    markers. This function navigates to the rows array and extracts text from
-    each cell.
-
-    Structure: raw_data[0][0][0][0][4][2] contains the rows array where:
-    - [0][0][0][0] navigates through wrapper layers
-    - [4] contains the table content section [type, flags, rows_array]
-    - [2] is the actual rows array
-
-    Each row has format: [start_pos, end_pos, [cell_array]]
-    Each cell is deeply nested: [pos, pos, [[pos, pos, [[pos, pos, [["text"]]]]]]]
-
-    Returns:
-        Tuple of (headers, rows) where headers is a list of column names
-        and rows is a list of row data (each row is a list of cell strings).
-
-    Raises:
-        ArtifactParseError: If the data structure cannot be parsed or is empty.
-    """
-    try:
-        # Navigate through nested wrappers to reach the rows array
-        rows_array = raw_data[0][0][0][0][4][2]
-        if not rows_array:
-            raise ArtifactParseError("data_table", details="Empty data table")
-
-        headers: list[str] = []
-        rows: list[list[str]] = []
-
-        for i, row_section in enumerate(rows_array):
-            # Each row_section is [start_pos, end_pos, cell_array]
-            if not isinstance(row_section, list) or len(row_section) < 3:
-                continue
-
-            cell_array = row_section[2]
-            if not isinstance(cell_array, list):
-                continue
-
-            row_values = [_extract_cell_text(cell) for cell in cell_array]
-
-            if i == 0:
-                headers = row_values
-            else:
-                rows.append(row_values)
-
-        # Validate we extracted usable data
-        if not headers:
-            raise ArtifactParseError(
-                "data_table",
-                details="Failed to extract headers from data table",
-            )
-
-        return headers, rows
-
-    except (IndexError, TypeError, KeyError) as e:
-        raise ArtifactParseError(
-            "data_table",
-            details=f"Failed to parse data table structure: {e}",
-            cause=e,
-        ) from e
-
-
-class ArtifactsAPI:
+class ArtifactsAPI(ABC):
     """Operations on NotebookLM artifacts (studio content).
 
-    Artifacts are AI-generated content including Audio Overviews, Video Overviews,
-    Reports, Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
+    Artifacts are AI-generated content: Audio/Video Overviews, Reports,
+    Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
 
-    Usage:
+    Usage::
+
         async with NotebookLMClient.from_storage() as client:
-            # Generate
             status = await client.artifacts.generate_audio(notebook_id)
             await client.artifacts.wait_for_completion(notebook_id, status.task_id)
-
-            # Download
             await client.artifacts.download_audio(notebook_id, "output.mp4")
-
-            # List and manage
             artifacts = await client.artifacts.list(notebook_id)
             await client.artifacts.rename(notebook_id, artifact_id, "New Title")
     """
 
+    @abstractmethod
+    def _operation_scope(
+        self, label: str
+    ) -> contextlib.AbstractAsyncContextManager[OperationLease | None]:
+        """Return the backend's scope for one multi-call workflow."""
+        raise NotImplementedError
+
     def __init__(
         self,
-        core: ClientCore,
-        notes_api: "NotesAPI",
-        storage_path: Path | None = None,
-    ):
-        """Initialize the artifacts API.
+        *,
+        supervisor: CallSupervisor,
+        notebooks: NotebookSourceIdProvider,
+        asset_downloads: AssetDownloadService,
+    ) -> None:
+        """Initialize the backend-neutral artifacts API.
 
         Args:
-            core: The core client infrastructure.
-            notes_api: The notes API for accessing notes/mind maps.
-            storage_path: Path to storage state file for loading download cookies.
+            supervisor: The single logical-call admission authority. Owns the
+                polling caller scope, leader-child task, loop-affinity guard,
+                and close-time drain-hook registration.
+            notebooks: Base-typed source-id resolver used by shared generation
+                workflows.
+            asset_downloads: Required backend-supplied neutral asset-transfer
+                service, configured with that backend's per-hop credential policy.
         """
-        self._core = core
-        self._notes = notes_api
-        self._storage_path = storage_path
-
-    # =========================================================================
-    # List/Get Operations
-    # =========================================================================
-
-    async def list(
-        self, notebook_id: str, artifact_type: ArtifactType | None = None
-    ) -> list[Artifact]:
-        """List all artifacts in a notebook, including mind maps.
-
-        This returns all AI-generated content: Audio Overviews, Video Overviews,
-        Reports, Quizzes, Flashcards, Infographics, Slide Decks, Data Tables,
-        and Mind Maps.
-
-        Note: Mind maps are stored in a separate system (notes) but are included
-        here since they are AI-generated studio content.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_type: Optional ArtifactType to filter by.
-                Use ArtifactType.MIND_MAP to get only mind maps.
-
-        Returns:
-            List of Artifact objects.
-        """
-        logger.debug("Listing artifacts in notebook %s", notebook_id)
-        artifacts: list[Artifact] = []
-
-        # Fetch studio artifacts (audio, video, reports, etc.)
-        params = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
-        result = await self._core.rpc_call(
-            RPCMethod.LIST_ARTIFACTS,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
+        self._supervisor = supervisor
+        self._notebooks = notebooks
+        self._asset_downloads = asset_downloads
+        self._poll_registry = PollRegistry()
+        self._polling = ArtifactPollingService(
+            supervisor=self._supervisor,
+            poll_registry=self._poll_registry,
         )
 
-        artifacts_data: list[Any] = []
-        if result and isinstance(result, list) and len(result) > 0:
-            artifacts_data = result[0] if isinstance(result[0], list) else result
+    @property
+    def creation_capabilities(self) -> tuple[ArtifactCreationCapability, ...]:
+        """Return immutable backend implementation support metadata.
 
-        for art_data in artifacts_data:
-            if isinstance(art_data, list) and len(art_data) > 0:
-                artifact = Artifact.from_api_response(art_data)
-                if artifact_type is None or artifact.kind == artifact_type:
-                    artifacts.append(artifact)
+        It is deliberately not an entitlement probe: an account may still lack
+        an advertised feature or have it temporarily unavailable upstream.
+        """
+        return (
+            ArtifactCreationCapability(
+                "audio", ("language", "instructions", "audio_format", "audio_length")
+            ),
+            ArtifactCreationCapability(
+                "video", ("language", "instructions", "video_format", "video_style", "style_prompt")
+            ),
+            ArtifactCreationCapability("cinematic_video", ("language", "instructions")),
+            ArtifactCreationCapability(
+                "report", ("report_format", "language", "custom_prompt", "extra_instructions")
+            ),
+            ArtifactCreationCapability("quiz", ("instructions", "quantity", "difficulty")),
+            ArtifactCreationCapability("flashcards", ("instructions", "quantity", "difficulty")),
+            ArtifactCreationCapability(
+                "infographic", ("language", "instructions", "orientation", "detail_level", "style")
+            ),
+            ArtifactCreationCapability(
+                "slide_deck", ("language", "instructions", "slide_format", "slide_length")
+            ),
+            ArtifactCreationCapability("data_table", ("language", "instructions")),
+        )
 
-        # Fetch mind maps from notes system (if not filtering to non-mind-map type)
-        if artifact_type is None or artifact_type == ArtifactType.MIND_MAP:
-            try:
-                mind_maps = await self._notes.list_mind_maps(notebook_id)
-                for mm_data in mind_maps:
-                    mind_map_artifact = Artifact.from_mind_map(mm_data)
-                    if mind_map_artifact is not None:  # None means deleted (status=2)
-                        if artifact_type is None or mind_map_artifact.kind == artifact_type:
-                            artifacts.append(mind_map_artifact)
-            except (RPCError, httpx.HTTPError) as e:
-                # Network/API errors - log and continue with studio artifacts
-                # This ensures users can see their audio/video/reports even if
-                # the mind maps endpoint is temporarily unavailable
-                logger.warning("Failed to fetch mind maps: %s", e)
+    @abstractmethod
+    async def _list_studio(
+        self,
+        notebook_id: str,
+        task_id: str,
+    ) -> builtins.list[Artifact]:
+        """List the decoded studio artifact matching a polling task, if present."""
 
-        return artifacts
+    @abstractmethod
+    async def list(
+        self, notebook_id: str, artifact_type: ArtifactType | None = None
+    ) -> builtins.list[Artifact]:
+        """List all artifacts in a notebook, including mind maps.
 
-    async def get(self, notebook_id: str, artifact_id: str) -> Artifact | None:
-        """Get a specific artifact by ID.
+        Returns all AI-generated content. Note-backed mind maps live in the
+        notes collection while interactive mind maps are studio artifacts
+        (type 4 / variant 4); this listing merges both backings under
+        ``ArtifactType.MIND_MAP``. Pass ``artifact_type`` to filter (e.g.
+        ``ArtifactType.MIND_MAP`` for mind maps only).
+        """
 
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The artifact ID.
+    @abstractmethod
+    async def list_with_status(
+        self, notebook_id: str, artifact_type: ArtifactType | None = None
+    ) -> ArtifactListing:
+        """List artifacts together with aggregate-read completeness evidence.
 
-        Returns:
-            Artifact object, or None if not found.
+        Primary Studio failures and all decoding failures raise directly.
+        A transient secondary backing failure returns the successfully decoded
+        items with ``is_complete=False`` and a bounded component diagnostic.
+        """
+
+    async def lookup(self, notebook_id: str, artifact_id: str) -> ArtifactLookup:
+        """Look up one artifact without confusing an incomplete read with absence.
+
+        An exact positive match is ``FOUND`` even if another aggregate backing
+        was unavailable. ``MISSING`` requires a complete aggregate read;
+        otherwise the result is ``UNKNOWN`` with bounded failure evidence.
+        """
+        listing = await self.list_with_status(notebook_id)
+        artifact = next((item for item in listing.items if item.id == artifact_id), None)
+        if artifact is not None:
+            return ArtifactLookup(
+                status=ArtifactLookupStatus.FOUND,
+                artifact=artifact,
+                failures=listing.failures,
+            )
+        if listing.is_complete:
+            return ArtifactLookup(status=ArtifactLookupStatus.MISSING)
+        return ArtifactLookup(
+            status=ArtifactLookupStatus.UNKNOWN,
+            failures=listing.failures,
+        )
+
+    async def get(self, notebook_id: str, artifact_id: str) -> Artifact:
+        """Get a specific artifact using the legacy absence projection.
+
+        Positive hits and complete misses emit no deprecation warning. An
+        incomplete no-hit preserves the legacy exception and emits the registered
+        ``artifact_ambiguous_absence`` warning. Use :meth:`lookup` to distinguish
+        authoritative absence from an unavailable backing.
+
+        Raises:
+            ArtifactNotFoundError: On a complete miss or the legacy incomplete
+                no-hit projection. :meth:`get_or_none` returns ``None`` instead.
+        """
+        result = await self.lookup(notebook_id, artifact_id)
+        if result.is_found:
+            assert result.artifact is not None
+            return result.artifact
+        if result.is_unknown:
+            _warn_ambiguous_artifact_absence()
+        if result.artifact is None:
+            raise ArtifactNotFoundError(artifact_id)
+        raise AssertionError("non-FOUND artifact lookup unexpectedly carried an artifact")
+
+    async def get_or_none(self, notebook_id: str, artifact_id: str) -> Artifact | None:
+        """Get an artifact by ID, returning ``None`` when it does not exist.
+
+        Positive hits and complete misses are warning-free (ADR-0019). An
+        incomplete no-hit preserves ``None`` during the 0.x compatibility period
+        and emits the registered ``artifact_ambiguous_absence`` warning. Use
+        :meth:`lookup` or :meth:`list_with_status` when completeness matters.
+        Primary listing failures and decoding faults propagate unchanged.
         """
         logger.debug("Getting artifact %s from notebook %s", artifact_id, notebook_id)
-        artifacts = await self.list(notebook_id)
-        for artifact in artifacts:
-            if artifact.id == artifact_id:
-                return artifact
+        result = await self.lookup(notebook_id, artifact_id)
+        if result.is_found:
+            return result.artifact
+        if result.is_unknown:
+            _warn_ambiguous_artifact_absence()
         return None
+
+    _get_or_none = get_or_none
+
+    @abstractmethod
+    async def get_prompt(
+        self,
+        notebook_id: str,
+        artifact_id: str,
+        *,
+        require_complete: bool = False,
+    ) -> str | None:
+        """Get the free-text prompt an artifact was generated from (any studio type).
+
+        Returns ``None`` when the artifact stores no prompt (e.g. a note-backed
+        mind map); raises :class:`ArtifactNotFoundError` for an unknown id.
+        ``require_complete=True`` prevents a failed aggregate backing from
+        being projected as absence. Web's direct prompt read is already strict;
+        Android uses :meth:`lookup` for this explicit path.
+
+        .. versionadded:: 0.8.0
+        """
 
     async def list_audio(self, notebook_id: str) -> builtins.list[Artifact]:
         """List audio overview artifacts."""
@@ -353,314 +340,147 @@ class ArtifactsAPI:
         """List data table artifacts."""
         return await self.list(notebook_id, ArtifactType.DATA_TABLE)
 
-    # =========================================================================
-    # Generate Operations
-    # =========================================================================
+    @abstractmethod
+    async def _send_create_artifact(
+        self,
+        request: NormalizedArtifactCreationRequest,
+    ) -> GenerationStatus:
+        """Encode and send one normalized backend creation request."""
+
+    _creation_policy = WEB_CREATION_POLICY
+
+    def _normalize_creation_request(
+        self, request: ArtifactCreationRequest
+    ) -> NormalizedArtifactCreationRequest:
+        return normalize_creation(request, self._creation_policy)
+
+    async def _create_artifact(self, request: ArtifactCreationRequest) -> GenerationStatus:
+        return await self._send_create_artifact(self._normalize_creation_request(request))
+
+    async def _resolve_source_ids(
+        self, notebook_id: str, source_ids: builtins.list[str] | None
+    ) -> builtins.list[str]:
+        return (
+            await self._notebooks.get_source_ids(notebook_id) if source_ids is None else source_ids
+        )
+
+    def _resolve_language(self, language: str | None) -> str:
+        return get_default_language() if language is None else language
 
     async def generate_audio(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
         audio_format: AudioFormat | None = None,
         audio_length: AudioLength | None = None,
     ) -> GenerationStatus:
-        """Generate an Audio Overview (podcast).
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Custom instructions for the podcast hosts.
-            audio_format: DEEP_DIVE, BRIEF, CRITIQUE, or DEBATE.
-            audio_length: SHORT, DEFAULT, or LONG.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
-
-        format_code = audio_format.value if audio_format else None
-        length_code = audio_length.value if audio_length else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                1,  # ArtifactTypeCode.AUDIO
-                source_ids_triple,
-                None,
-                None,
-                [
-                    None,
-                    [
-                        instructions,
-                        length_code,
-                        None,
-                        source_ids_double,
-                        language,
-                        None,
-                        format_code,
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate an Audio Overview (podcast)."""
+        async with self._operation_scope("artifacts.generate_audio"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                AudioCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    language,
+                    instructions,
+                    audio_format,
+                    audio_length,
+                )
+            )
 
     async def generate_video(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
         video_format: VideoFormat | None = None,
         video_style: VideoStyle | None = None,
+        style_prompt: str | None = None,
     ) -> GenerationStatus:
-        """Generate a Video Overview.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Custom instructions for video generation.
-            video_format: EXPLAINER or BRIEF.
-            video_style: AUTO_SELECT, CLASSIC, WHITEBOARD, etc.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
-
-        format_code = video_format.value if video_format else None
-        style_code = video_style.value if video_style else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                3,  # ArtifactTypeCode.VIDEO
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                [
-                    None,
-                    None,
-                    [
-                        source_ids_double,
-                        language,
-                        instructions,
-                        None,
-                        format_code,
-                        style_code,
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate a Video Overview."""
+        language = self._resolve_language(language)
+        normalized_style_prompt = normalize_video_prompt(video_format, video_style, style_prompt)
+        async with self._operation_scope("artifacts.generate_video"):
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                VideoCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    language,
+                    instructions,
+                    video_format,
+                    video_style,
+                    normalized_style_prompt,
+                )
+            )
 
     async def generate_cinematic_video(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
     ) -> GenerationStatus:
-        """Generate a Cinematic Video Overview.
-
-        Cinematic videos use AI-generated documentary-style footage (Veo 3)
-        instead of the slide-deck animations used by standard video overviews.
-        They do not accept VideoStyle options.
-
-        Requires a Google AI Ultra subscription. Uses the same CREATE_ARTIFACT
-        RPC as standard videos with VideoFormat.CINEMATIC (3). Parameter
-        structure verified against NotebookLM web UI network traffic
-        (March 2026).
-
-        Note: Generation takes significantly longer than standard videos
-        (~30-40 minutes) due to Veo 3 rendering.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Custom instructions for video generation.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                ArtifactTypeCode.VIDEO.value,
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                [
-                    None,
-                    None,
-                    [
-                        source_ids_double,
-                        language,
-                        instructions,
-                        None,
-                        VideoFormat.CINEMATIC.value,
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate a Cinematic Video Overview."""
+        async with self._operation_scope("artifacts.generate_cinematic_video"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                CinematicVideoCreationRequest(
+                    notebook_id, tuple(source_ids), language, instructions
+                )
+            )
 
     async def generate_report(
         self,
         notebook_id: str,
         report_format: ReportFormat = ReportFormat.BRIEFING_DOC,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         custom_prompt: str | None = None,
         extra_instructions: str | None = None,
     ) -> GenerationStatus:
-        """Generate a report artifact.
-
-        Args:
-            notebook_id: The notebook ID.
-            report_format: BRIEFING_DOC, STUDY_GUIDE, BLOG_POST, or CUSTOM.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            custom_prompt: Prompt for CUSTOM format. Falls back to a generic
-                default if None.
-            extra_instructions: Additional instructions appended to the built-in
-                template prompt. Ignored when report_format is CUSTOM; for custom
-                reports, embed all instructions in custom_prompt instead.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        format_configs = {
-            ReportFormat.BRIEFING_DOC: {
-                "title": "Briefing Doc",
-                "description": "Key insights and important quotes",
-                "prompt": (
-                    "Create a comprehensive briefing document that includes an "
-                    "Executive Summary, detailed analysis of key themes, important "
-                    "quotes with context, and actionable insights."
-                ),
-            },
-            ReportFormat.STUDY_GUIDE: {
-                "title": "Study Guide",
-                "description": "Short-answer quiz, essay questions, glossary",
-                "prompt": (
-                    "Create a comprehensive study guide that includes key concepts, "
-                    "short-answer practice questions, essay prompts for deeper "
-                    "exploration, and a glossary of important terms."
-                ),
-            },
-            ReportFormat.BLOG_POST: {
-                "title": "Blog Post",
-                "description": "Insightful takeaways in readable article format",
-                "prompt": (
-                    "Write an engaging blog post that presents the key insights "
-                    "in an accessible, reader-friendly format. Include an attention-"
-                    "grabbing introduction, well-organized sections, and a compelling "
-                    "conclusion with takeaways."
-                ),
-            },
-            ReportFormat.CUSTOM: {
-                "title": "Custom Report",
-                "description": "Custom format",
-                "prompt": custom_prompt or "Create a report based on the provided sources.",
-            },
-        }
-
-        config = format_configs[report_format]
-        if extra_instructions and report_format != ReportFormat.CUSTOM:
-            config = {**config, "prompt": f"{config['prompt']}\n\n{extra_instructions}"}
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                2,  # ArtifactTypeCode.REPORT
-                source_ids_triple,
-                None,
-                None,
-                None,
-                [
-                    None,
-                    [
-                        config["title"],
-                        config["description"],
-                        None,
-                        source_ids_double,
-                        language,
-                        config["prompt"],
-                        None,
-                        True,
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate a report artifact."""
+        async with self._operation_scope("artifacts.generate_report"):
+            report_format = _artifact_validation.coerce_report_format(report_format)
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                ReportCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    report_format,
+                    language,
+                    custom_prompt,
+                    extra_instructions,
+                )
+            )
 
     async def generate_study_guide(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         extra_instructions: str | None = None,
     ) -> GenerationStatus:
-        """Generate a study guide report.
-
-        Convenience method wrapping generate_report with STUDY_GUIDE format.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            extra_instructions: Additional instructions appended to the default template.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        return await self.generate_report(
-            notebook_id,
-            report_format=ReportFormat.STUDY_GUIDE,
-            source_ids=source_ids,
-            language=language,
-            extra_instructions=extra_instructions,
-        )
+        """Generate a study guide report."""
+        async with self._operation_scope("artifacts.generate_study_guide"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                ReportCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    ReportFormat.STUDY_GUIDE,
+                    language,
+                    None,
+                    extra_instructions,
+                )
+            )
 
     async def generate_quiz(
         self,
@@ -670,54 +490,14 @@ class ArtifactsAPI:
         quantity: QuizQuantity | None = None,
         difficulty: QuizDifficulty | None = None,
     ) -> GenerationStatus:
-        """Generate a quiz.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            instructions: Custom instructions for quiz generation.
-            quantity: FEWER, STANDARD, or MORE questions.
-            difficulty: EASY, MEDIUM, or HARD.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        quantity_code = quantity.value if quantity else None
-        difficulty_code = difficulty.value if difficulty else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                4,  # ArtifactTypeCode.QUIZ_FLASHCARD
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [
-                    None,
-                    [
-                        2,  # Variant: quiz
-                        None,
-                        instructions,
-                        None,
-                        None,
-                        None,
-                        None,
-                        [quantity_code, difficulty_code],
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate a quiz."""
+        async with self._operation_scope("artifacts.generate_quiz"):
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                QuizCreationRequest(
+                    notebook_id, tuple(source_ids), instructions, quantity, difficulty
+                )
+            )
 
     async def generate_flashcards(
         self,
@@ -727,549 +507,235 @@ class ArtifactsAPI:
         quantity: QuizQuantity | None = None,
         difficulty: QuizDifficulty | None = None,
     ) -> GenerationStatus:
-        """Generate flashcards.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            instructions: Custom instructions for flashcard generation.
-            quantity: FEWER, STANDARD, or MORE cards.
-            difficulty: EASY, MEDIUM, or HARD.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        quantity_code = quantity.value if quantity else None
-        difficulty_code = difficulty.value if difficulty else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                4,  # ArtifactTypeCode.QUIZ_FLASHCARD
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [
-                    None,
-                    [
-                        1,  # Variant: flashcards
-                        None,
-                        instructions,
-                        None,
-                        None,
-                        None,
-                        [difficulty_code, quantity_code],
-                    ],
-                ],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate flashcards."""
+        async with self._operation_scope("artifacts.generate_flashcards"):
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                FlashcardsCreationRequest(
+                    notebook_id, tuple(source_ids), instructions, quantity, difficulty
+                )
+            )
 
     async def generate_infographic(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
         orientation: InfographicOrientation | None = None,
         detail_level: InfographicDetail | None = None,
         style: InfographicStyle | None = None,
     ) -> GenerationStatus:
-        """Generate an infographic.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Custom instructions for infographic generation.
-            orientation: LANDSCAPE, PORTRAIT, or SQUARE.
-            detail_level: CONCISE, STANDARD, or DETAILED.
-            style: Visual style preset for the infographic.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        orientation_code = orientation.value if orientation else None
-        detail_code = detail_level.value if detail_level else None
-        style_code = style.value if style else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                7,  # ArtifactTypeCode.INFOGRAPHIC
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [[instructions, language, None, orientation_code, detail_code, style_code]],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
+        """Generate an infographic."""
+        async with self._operation_scope("artifacts.generate_infographic"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                InfographicCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    language,
+                    instructions,
+                    orientation,
+                    detail_level,
+                    style,
+                )
+            )
 
     async def generate_slide_deck(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
         slide_format: SlideDeckFormat | None = None,
         slide_length: SlideDeckLength | None = None,
     ) -> GenerationStatus:
-        """Generate a slide deck.
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Custom instructions for slide deck generation.
-            slide_format: DETAILED_DECK or PRESENTER_SLIDES.
-            slide_length: DEFAULT or SHORT.
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
-
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        format_code = slide_format.value if slide_format else None
-        length_code = slide_length.value if slide_length else None
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                8,  # ArtifactTypeCode.SLIDE_DECK
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [[instructions, language, format_code, length_code]],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
-
-    async def revise_slide(
-        self,
-        notebook_id: str,
-        artifact_id: str,
-        slide_index: int,
-        prompt: str,
-    ) -> GenerationStatus:
-        """Revise an individual slide in a completed slide deck using a prompt.
-
-        The slide deck must already be generated (status=COMPLETED) before
-        calling this method. Use poll_status() to wait for the revision to complete.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The slide deck artifact ID to revise.
-            slide_index: Zero-based index of the slide to revise.
-            prompt: Natural language instruction for the revision
-                    (e.g. "Move the title up", "Remove taxonomy section").
-
-        Returns:
-            GenerationStatus with task_id for polling.
-        """
-        if slide_index < 0:
-            raise ValidationError(f"slide_index must be >= 0, got {slide_index}")
-
-        params = [
-            [2],
-            artifact_id,
-            [[[slide_index, prompt]]],
-        ]
-        try:
-            result = await self._core.rpc_call(
-                RPCMethod.REVISE_SLIDE,
-                params,
-                source_path=f"/notebook/{notebook_id}",
-                allow_null=True,
-            )
-            if result is None:
-                logger.warning("REVISE_SLIDE returned null result for artifact %s", artifact_id)
-            return self._parse_generation_result(result)
-        except RPCError as e:
-            if e.rpc_code == "USER_DISPLAYABLE_ERROR":
-                return GenerationStatus(
-                    task_id="",
-                    status="failed",
-                    error=str(e),
-                    error_code=str(e.rpc_code) if e.rpc_code is not None else None,
+        """Generate a slide deck."""
+        async with self._operation_scope("artifacts.generate_slide_deck"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                SlideDeckCreationRequest(
+                    notebook_id,
+                    tuple(source_ids),
+                    language,
+                    instructions,
+                    slide_format,
+                    slide_length,
                 )
-            raise
+            )
 
     async def generate_data_table(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = "en",
         instructions: str | None = None,
     ) -> GenerationStatus:
-        """Generate a data table.
+        """Generate a data table."""
+        async with self._operation_scope("artifacts.generate_data_table"):
+            language = self._resolve_language(language)
+            source_ids = await self._resolve_source_ids(notebook_id, source_ids)
+            return await self._create_artifact(
+                DataTableCreationRequest(notebook_id, tuple(source_ids), language, instructions)
+            )
 
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
-            instructions: Description of desired table structure.
+    @abstractmethod
+    async def revise_slide(
+        self, notebook_id: str, artifact_id: str, slide_index: int, prompt: str
+    ) -> GenerationStatus:
+        """Revise an individual slide in a completed slide deck using a prompt."""
 
-        Returns:
-            GenerationStatus with task_id for polling.
+    @abstractmethod
+    async def retry_failed(self, notebook_id: str, artifact_id: str) -> GenerationStatus:
+        """Retry a failed Studio artifact in place (the UI "Retry" action).
+
+        Re-runs generation for an already-failed artifact without deleting it
+        first; the same ``artifact_id`` is preserved as the task id, so existing
+        :meth:`poll_status` / :meth:`wait_for_completion` flows keep working. An
+        accepted retry returns ``GenerationStatus(status="pending")`` (#2127).
+
+        Follows the ADR-0019 "async kickoff" contract: a synchronous
+        ``USER_DISPLAYABLE_ERROR`` refusal (rate limit, quota, non-retryable
+        artifact) **raises** ``RateLimitError`` / ``RPCError`` rather than
+        returning ``status="failed"``, matching the sibling ``generate_*`` /
+        :meth:`revise_slide` methods after v0.8.0 (#1342). A null / missing-id
+        result raises :class:`ArtifactFeatureUnavailableError`. ``notebook_id``
+        is routing-only (sets the ``source_path`` header); the artifact is
+        identified solely by ``artifact_id``.
         """
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-
-        params = [
-            [2],
-            notebook_id,
-            [
-                None,
-                None,
-                9,  # ArtifactTypeCode.DATA_TABLE
-                source_ids_triple,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [None, [instructions, language]],
-            ],
-        ]
-        return await self._call_generate(notebook_id, params)
-
+    @abstractmethod
     async def generate_mind_map(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Generate an interactive mind map.
+        language: str | None = "en",
+        instructions: str | None = None,
+    ) -> MindMapResult:
+        """Generate a note-backed mind map and persist it as a note.
 
-        The mind map is generated and saved as a note in the notebook.
-        It will appear in artifact listings with type MIND_MAP (5).
-
-        Args:
-            notebook_id: The notebook ID.
-            source_ids: Source IDs to include. If None, uses all sources.
-
-        Returns:
-            Dictionary with 'mind_map' (JSON data) and 'note_id'.
+        Returns a :class:`~notebooklm._types.research.MindMapResult` with
+        ``mind_map`` (parsed structure, or ``None`` on an empty response) and
+        ``note_id`` (the persisted note id, or ``None``).
         """
-        import json as json_module
 
-        if source_ids is None:
-            source_ids = await self._core.get_source_ids(notebook_id)
+    @abstractmethod
+    async def prepare_downloads(self, request: ArtifactDownloadRequest) -> ArtifactDownloadListing:
+        """Prepare completed candidates without exposing backend caches.
 
-        source_ids_nested = [[[sid]] for sid in source_ids] if source_ids else []
+        Validate the representation before I/O. Every returned selection is
+        bound to this backend instance, notebook, and current client generation.
+        Partial results retain typed failure evidence; they do not prove absence.
+        """
 
-        params = [
-            source_ids_nested,
-            None,
-            None,
-            None,
-            None,
-            ["interactive_mindmap", [["[CONTEXT]", ""]], ""],
-            None,
-            [2, None, [1]],
-        ]
+    @abstractmethod
+    async def download(self, selection: ArtifactDownloadSelection, output_path: str) -> str:
+        """Download an owned prepared identity within its admitted generation."""
 
-        result = await self._core.rpc_call(
-            RPCMethod.GENERATE_MIND_MAP,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
+    @abstractmethod
+    async def _download_with_legacy_prefetch(
+        self,
+        request: ArtifactDownloadRequest,
+        output_path: str,
+        artifact_id: str | None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
+        mind_maps: builtins.list[Any] | None = None,
+        artifacts: builtins.list[Artifact] | None = None,
+    ) -> str:
+        """Backend-owned compatibility adapter for existing raw-prefetch kwargs."""
 
-        if result and isinstance(result, list) and len(result) > 0:
-            inner = result[0]
-            if isinstance(inner, list) and len(inner) > 0:
-                mind_map_json = inner[0]
-
-                # Parse the mind map JSON
-                if isinstance(mind_map_json, str):
-                    try:
-                        mind_map_data = json_module.loads(mind_map_json)
-                    except json_module.JSONDecodeError:
-                        mind_map_data = mind_map_json
-                        mind_map_json = str(mind_map_json)
-                else:
-                    mind_map_data = mind_map_json
-                    mind_map_json = json_module.dumps(mind_map_json)
-
-                # Extract title from mind map data
-                title = "Mind Map"
-                if isinstance(mind_map_data, dict) and "name" in mind_map_data:
-                    title = mind_map_data["name"]
-
-                # The GENERATE_MIND_MAP RPC generates content but does NOT persist it.
-                # We must explicitly create a note to save the mind map.
-                note = await self._notes.create(notebook_id, title=title, content=mind_map_json)
-                note_id = note.id if note else None
-
-                return {
-                    "mind_map": mind_map_data,
-                    "note_id": note_id,
-                }
-
-        return {"mind_map": None, "note_id": None}
-
-    # =========================================================================
-    # Download Operations
-    # =========================================================================
+    async def _download_per_kind(
+        self,
+        request: ArtifactDownloadRequest,
+        output_path: str,
+        artifact_id: str | None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
+        mind_maps: builtins.list[Any] | None = None,
+        artifacts: builtins.list[Artifact] | None = None,
+    ) -> str:
+        # Legacy methods keep backend-specific selection, lazy-read ordering,
+        # format validation, and exception precedence. The additive typed API
+        # is used by first-party orchestration; routing legacy calls through
+        # its aggregate selection would change these established contracts.
+        try:
+            async with self._operation_scope(f"artifacts.download_{request.kind.value}"):
+                if any(value is not None for value in (artifacts_data, mind_maps, artifacts)):
+                    warn_registered_deprecation("artifact_raw_download_prefetch")
+                return await self._download_with_legacy_prefetch(
+                    request,
+                    output_path,
+                    artifact_id,
+                    artifacts_data=artifacts_data,
+                    mind_maps=mind_maps,
+                    artifacts=artifacts,
+                )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data, mind_maps, artifacts
 
     async def download_audio(
-        self, notebook_id: str, output_path: str, artifact_id: str | None = None
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
     ) -> str:
-        """Download an Audio Overview to a file.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the audio file (MP4/MP3).
-            artifact_id: Specific artifact ID, or uses first completed audio.
-
-        Returns:
-            The output path.
-        """
-        artifacts_data = await self._list_raw(notebook_id)
-
-        # Filter for completed audio artifacts
-        audio_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.AUDIO
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            audio_art = next((a for a in audio_candidates if a[0] == artifact_id), None)
-            if not audio_art:
-                raise ArtifactNotReadyError("audio", artifact_id=artifact_id)
-        else:
-            audio_art = audio_candidates[0] if audio_candidates else None
-
-        if not audio_art:
-            raise ArtifactNotReadyError("audio")
-
-        # Extract URL from metadata[6][5]
+        """Download an Audio Overview to a file."""
         try:
-            metadata = audio_art[6]
-            if not isinstance(metadata, list) or len(metadata) <= 5:
-                raise ArtifactParseError(
-                    "audio",
-                    artifact_id=artifact_id,
-                    details="Invalid audio metadata structure",
-                )
-
-            media_list = metadata[5]
-            if not isinstance(media_list, list) or len(media_list) == 0:
-                raise ArtifactParseError(
-                    "audio",
-                    artifact_id=artifact_id,
-                    details="No media URLs found",
-                )
-
-            url = None
-            for item in media_list:
-                if isinstance(item, list) and len(item) > 2 and item[2] == "audio/mp4":
-                    url = item[0]
-                    break
-
-            if not url and len(media_list) > 0 and isinstance(media_list[0], list):
-                url = media_list[0][0]
-
-            if not url:
-                raise ArtifactDownloadError(
-                    "audio",
-                    artifact_id=artifact_id,
-                    details="Could not extract download URL",
-                )
-
-            return await self._download_url(url, output_path)
-
-        except (IndexError, TypeError) as e:
-            raise ArtifactParseError(
-                "audio",
-                artifact_id=artifact_id,
-                details=f"Failed to parse audio artifact structure: {e}",
-                cause=e,
-            ) from e
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.AUDIO, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
 
     async def download_video(
-        self, notebook_id: str, output_path: str, artifact_id: str | None = None
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
     ) -> str:
-        """Download a Video Overview to a file.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the video file (MP4).
-            artifact_id: Specific artifact ID, or uses first completed video.
-
-        Returns:
-            The output path.
-        """
-        artifacts_data = await self._list_raw(notebook_id)
-
-        # Filter for completed video artifacts
-        video_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.VIDEO
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            video_art = next((v for v in video_candidates if v[0] == artifact_id), None)
-            if not video_art:
-                raise ArtifactNotReadyError("video", artifact_id=artifact_id)
-        else:
-            video_art = video_candidates[0] if video_candidates else None
-
-        if not video_art:
-            raise ArtifactNotReadyError("video_overview")
-
-        # Extract URL from metadata[8]
+        """Download a Video Overview to a file."""
         try:
-            if len(video_art) <= 8:
-                raise ArtifactParseError("video_artifact", details="Invalid structure")
-
-            metadata = video_art[8]
-            if not isinstance(metadata, list):
-                raise ArtifactParseError("video_metadata", details="Invalid structure")
-
-            media_list = None
-            for item in metadata:
-                if (
-                    isinstance(item, list)
-                    and len(item) > 0
-                    and isinstance(item[0], list)
-                    and len(item[0]) > 0
-                    and isinstance(item[0][0], str)
-                    and item[0][0].startswith("http")
-                ):
-                    media_list = item
-                    break
-
-            if not media_list:
-                raise ArtifactParseError("media", details="No media URLs found")
-
-            url = None
-            for item in media_list:
-                if isinstance(item, list) and len(item) > 2 and item[2] == "video/mp4":
-                    url = item[0]
-                    if item[1] == 4:
-                        break
-
-            if not url and len(media_list) > 0:
-                url = media_list[0][0]
-
-            if not url:
-                raise ArtifactDownloadError("media", details="Could not extract download URL")
-
-            return await self._download_url(url, output_path)
-
-        except (IndexError, TypeError) as e:
-            raise ArtifactParseError(
-                "video_artifact", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.VIDEO, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
 
     async def download_infographic(
-        self, notebook_id: str, output_path: str, artifact_id: str | None = None
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
     ) -> str:
-        """Download an Infographic to a file.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the image file (PNG).
-            artifact_id: Specific artifact ID, or uses first completed infographic.
-
-        Returns:
-            The output path.
-        """
-        artifacts_data = await self._list_raw(notebook_id)
-
-        # Filter for completed infographic artifacts
-        info_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.INFOGRAPHIC
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            info_art = next((i for i in info_candidates if i[0] == artifact_id), None)
-            if not info_art:
-                raise ArtifactNotReadyError("infographic", artifact_id=artifact_id)
-        else:
-            info_art = info_candidates[0] if info_candidates else None
-
-        if not info_art:
-            raise ArtifactNotReadyError("infographic")
-
-        # Reuse the shared helper so readiness checks and downloads agree on
-        # which URL to select (both now iterate forward, preferring the
-        # canonical content URL at a lower index).
+        """Download an Infographic to a file."""
         try:
-            url = self._find_infographic_url(info_art)
-            if not url:
-                raise ArtifactParseError("infographic", details="Could not find metadata")
-            return await self._download_url(url, output_path)
-
-        except (IndexError, TypeError) as e:
-            raise ArtifactParseError(
-                "infographic", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.INFOGRAPHIC, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
 
     async def download_slide_deck(
         self,
@@ -1277,175 +743,254 @@ class ArtifactsAPI:
         output_path: str,
         artifact_id: str | None = None,
         output_format: str = "pdf",
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
     ) -> str:
-        """Download a slide deck as PDF or PPTX.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the file.
-            artifact_id: Specific artifact ID, or uses first completed slide deck.
-            output_format: Download format: "pdf" (default) or "pptx".
-
-        Returns:
-            The output path.
-        """
-        if output_format not in ("pdf", "pptx"):
-            raise ValidationError(f"Invalid format '{output_format}'. Must be 'pdf' or 'pptx'.")
-
-        artifacts_data = await self._list_raw(notebook_id)
-
-        # Filter for completed slide deck artifacts
-        slide_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.SLIDE_DECK
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            slide_art = next((s for s in slide_candidates if s[0] == artifact_id), None)
-            if not slide_art:
-                raise ArtifactNotReadyError("slide_deck", artifact_id=artifact_id)
-        else:
-            slide_art = slide_candidates[0] if slide_candidates else None
-
-        if not slide_art:
-            raise ArtifactNotReadyError("slide_deck")
-
-        # Extract download URL from metadata at index 16
-        # Structure: artifact[16] = [config, title, slides_list, pdf_url, pptx_url]
+        """Download a slide deck as PDF or PPTX."""
         try:
-            if len(slide_art) <= 16:
-                raise ArtifactParseError("slide_deck_artifact", details="Invalid structure")
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.SLIDE_DECK, output_format),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
 
-            metadata = slide_art[16]
-            if not isinstance(metadata, list):
-                raise ArtifactParseError("slide_deck_metadata", details="Invalid structure")
-
-            if output_format == "pptx":
-                if len(metadata) < 5:
-                    raise ArtifactDownloadError(
-                        "slide_deck", details="PPTX URL not available in artifact data"
-                    )
-                url = metadata[4]
-            else:
-                if len(metadata) < 4:
-                    raise ArtifactParseError("slide_deck_metadata", details="Invalid structure")
-                url = metadata[3]
-
-            if not isinstance(url, str) or not url.startswith("http"):
-                raise ArtifactDownloadError(
-                    "slide_deck",
-                    details=f"Could not find {output_format.upper()} download URL",
-                )
-
-        except (IndexError, TypeError) as e:
-            raise ArtifactParseError(
-                "slide_deck", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
-
-        return await self._download_url(url, output_path)
-
-    async def _get_artifact_content(self, notebook_id: str, artifact_id: str) -> str | None:
-        """Fetch artifact HTML content for quiz/flashcard types."""
-        result = await self._core.rpc_call(
-            RPCMethod.GET_INTERACTIVE_HTML,
-            [artifact_id],
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        # Response is wrapped: result[0] contains the artifact data
-        if result and isinstance(result, list) and len(result) > 0:
-            data = result[0]
-            if isinstance(data, list) and len(data) > 9 and data[9]:
-                return data[9][0]  # HTML content
-        return None
-
-    async def _download_interactive_artifact(
+    async def download_report(
         self,
         notebook_id: str,
         output_path: str,
-        artifact_id: str | None,
-        output_format: str,
-        artifact_type: str,
+        artifact_id: str | None = None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
     ) -> str:
-        """Download quiz or flashcard artifact.
+        """Download a report artifact as markdown."""
+        try:
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.REPORT, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
 
-        Args:
-            notebook_id: Notebook ID.
-            output_path: Output file path.
-            artifact_id: Specific artifact ID (optional).
-            output_format: Output format - json, markdown, or html.
-            artifact_type: Either "quiz" or "flashcards".
+    async def download_mind_map(
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        *,
+        mind_maps: builtins.list[Any] | None = None,
+        artifacts_data: builtins.list[Any] | None = None,
+    ) -> str:
+        """Download a mind map as JSON."""
+        try:
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.MIND_MAP, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+                mind_maps=mind_maps,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data, mind_maps
 
-        Returns:
-            Path to downloaded file.
+    async def download_data_table(
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        *,
+        artifacts_data: builtins.list[Any] | None = None,
+    ) -> str:
+        """Download a data table as CSV."""
+        try:
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.DATA_TABLE, None),
+                output_path,
+                artifact_id,
+                artifacts_data=artifacts_data,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts_data
+
+    async def download_quiz(
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        output_format: str = "json",
+        *,
+        artifacts: builtins.list[Artifact] | None = None,
+    ) -> str:
+        """Download quiz questions."""
+        try:
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.QUIZ, output_format),
+                output_path,
+                artifact_id,
+                artifacts=artifacts,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts
+
+    async def download_flashcards(
+        self,
+        notebook_id: str,
+        output_path: str,
+        artifact_id: str | None = None,
+        output_format: str = "json",
+        *,
+        artifacts: builtins.list[Artifact] | None = None,
+    ) -> str:
+        """Download flashcard deck."""
+        try:
+            return await self._download_per_kind(
+                ArtifactDownloadRequest(notebook_id, ArtifactType.FLASHCARDS, output_format),
+                output_path,
+                artifact_id,
+                artifacts=artifacts,
+            )
+        finally:
+            # Retained exception frames must not keep the backend or raw capabilities.
+            del self, artifacts
+
+    @abstractmethod
+    async def delete(self, notebook_id: str, artifact_id: str) -> None:
+        """Delete an artifact.
+
+        Idempotent: deleting an already-absent artifact succeeds (returns
+        ``None``) and never raises ``ArtifactNotFoundError``. Real failures
+        (``403``/``5xx``/auth/transport) still propagate.
+
+        .. versionchanged:: 0.7.0
+            **Breaking change:** previously returned a hardcoded ``True``;
+            now returns ``None`` (issue #1211). ``if await artifacts.delete(...):``
+            no longer enters its block.
+        """
+
+    @abstractmethod
+    async def rename(
+        self,
+        notebook_id: str,
+        artifact_id: str,
+        new_title: str,
+        *,
+        return_object: bool = True,
+    ) -> Artifact | None:
+        """Rename an artifact.
+
+        ``return_object=True`` (default) re-fetches (a full ``LIST_ARTIFACTS``
+        call) and returns the renamed :class:`~notebooklm.types.Artifact`;
+        ``False`` returns ``None`` on success. Miss-detection runs in both
+        modes.
 
         Raises:
-            ValueError: If no completed artifact found or invalid output_format.
+            ArtifactNotFoundError: if the artifact does not exist (detected via
+                a list fetch, not a 404), in both ``return_object`` modes.
+                Note-backed mind-map ids are *not* renameable here — use
+                ``mind_maps.rename``.
+
+        .. versionchanged:: 0.7.0
+            **Breaking change:** no longer returns ``None`` on success; it
+            re-fetches and raises :class:`ArtifactNotFoundError` for a missing
+            target (#1255), plus the ``return_object`` opt-out.
+
+        .. versionchanged:: 0.8.0
+            **Breaking change:** ``return_object=False`` now runs the existence
+            preflight too, so a missing target raises
+            :class:`ArtifactNotFoundError` instead of silently returning
+            ``None`` (#1362).
         """
-        # Validate output format
-        valid_formats = ("json", "markdown", "html")
-        if output_format not in valid_formats:
-            raise ValidationError(
-                f"Invalid output_format: {output_format!r}. Use one of: {', '.join(valid_formats)}"
-            )
 
-        # Type-specific configuration
-        is_quiz = artifact_type == "quiz"
-        default_title = "Untitled Quiz" if is_quiz else "Untitled Flashcards"
+    async def poll_status(self, notebook_id: str, task_id: str) -> GenerationStatus:
+        """Poll the status of a generation task.
 
-        # Fetch and filter artifacts
-        artifacts = (
-            await self.list_quizzes(notebook_id)
-            if is_quiz
-            else await self.list_flashcards(notebook_id)
-        )
-        completed = [a for a in artifacts if a.is_completed]
-        if not completed:
-            raise ArtifactNotReadyError(artifact_type)
+        Returns a ``GenerationStatus``; when the artifact is absent from the
+        list, ``status`` is ``"not_found"`` so callers can distinguish
+        a queued artifact from an unresolved listing absence. Absence does not
+        establish removal or a quota rejection.
 
-        # Sort by creation date to ensure we get the latest by default
-        completed.sort(key=lambda a: a.created_at.timestamp() if a.created_at else 0, reverse=True)
-
-        # Select artifact
-        if artifact_id:
-            artifact = next((a for a in completed if a.id == artifact_id), None)
-            if not artifact:
-                raise ArtifactNotFoundError(artifact_id, artifact_type=artifact_type)
-        else:
-            artifact = completed[0]
-
-        # Fetch and parse HTML content
-        html_content = await self._get_artifact_content(notebook_id, artifact.id)
-        if not html_content:
-            raise ArtifactDownloadError(artifact_type, details="Failed to fetch content")
-
-        try:
-            app_data = _extract_app_data(html_content)
-        except (ValueError, json.JSONDecodeError) as e:
-            raise ArtifactParseError(
-                artifact_type, details=f"Failed to parse content: {e}", cause=e
-            ) from e
-
-        # Format output
-        title = artifact.title or default_title
-        content = self._format_interactive_content(
-            app_data, title, output_format, html_content, is_quiz
+        .. versionchanged:: 0.4.0
+            **Breaking change:** Previously returned ``status="pending"`` when
+            an artifact was absent from the list; now returns
+            ``status="not_found"``.
+        """
+        return await self._polling.poll_status(
+            notebook_id,
+            task_id,
+            list_studio=self._list_studio,
         )
 
-        # Create parent directories and write file
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+    async def wait_for_completion(
+        self,
+        notebook_id: str,
+        task_id: str,
+        initial_interval: float = 2.0,
+        max_interval: float = 10.0,
+        timeout: float = 300.0,
+        max_not_found: int = 5,
+        min_not_found_window: float = 10.0,
+        on_status_change: Callable[[GenerationStatus], object] | None = None,
+    ) -> GenerationStatus:
+        """Wait for a generation task to complete (exponential-backoff polling).
 
-        def _write_file() -> None:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(content)
+        Concurrent callers for the same ``(notebook_id, task_id)`` share a
+        single poll loop via this API's feature-owned ``PollRegistry``. The
+        first caller is the *leader* and drives the loop; *followers* attach to
+        the leader's future without issuing their own ``LIST_ARTIFACTS``
+        requests. Cancellation is per-caller — only the cancelled caller's
+        ``await`` raises ``CancelledError``; the poll continues and remaining
+        followers still receive the result. Only the *leader's* interval /
+        timeout options apply to the shared loop; followers' values
+        are ignored once they attach. Distinct waiters that genuinely need
+        distinct timeouts should serialize their calls instead.
 
-        await asyncio.to_thread(_write_file)
-        return output_path
+        A missing artifact remains ``"not_found"`` until it reappears or the
+        timeout expires. Listing absence never establishes removal or quota
+        failure, and a completed sibling never substitutes for ``task_id``.
+
+        ``max_not_found`` and ``min_not_found_window`` are deprecated and ignored;
+        use ``timeout`` to bound the wait. Non-default values emit a
+        ``DeprecationWarning``. The historical defaults remain accepted silently.
+        ``on_status_change`` is an optional sync/async callback invoked when the
+        leader observes a new status (followers receive only the final status).
+
+        Raises:
+            TimeoutError: If task doesn't complete within ``timeout``.
+        """
+        if max_not_found != 5 or min_not_found_window != 10.0:
+            warn_registered_deprecation("artifact_poll_absence_thresholds")
+        return await self._polling.wait_for_completion(
+            notebook_id,
+            task_id,
+            initial_interval=initial_interval,
+            max_interval=max_interval,
+            timeout=timeout,
+            poll_status=self.poll_status,
+            on_status_change=on_status_change,
+        )
+
+    async def _download_to_path(self, url: str, output_path: str) -> str:
+        """Transfer a resolved byte URL through the shared asset plane."""
+        return await self._asset_downloads.download_url(url, output_path)
+
+    async def _download_url(self, url: str, output_path: str) -> str:
+        """Compatibility alias for the historical private transfer helper."""
+        return await self._download_to_path(url, output_path)
+
+    async def _download_urls_batch(
+        self, urls_and_paths: builtins.list[tuple[str, str]]
+    ) -> DownloadResult:
+        """Transfer multiple resolved byte URLs through the shared asset plane."""
+        return await self._asset_downloads.download_urls_batch(urls_and_paths)
 
     def _format_interactive_content(
         self,
@@ -1455,457 +1000,14 @@ class ArtifactsAPI:
         html_content: str,
         is_quiz: bool,
     ) -> str:
-        """Format quiz or flashcard content for output.
-
-        Args:
-            app_data: Parsed data from HTML.
-            title: Artifact title.
-            output_format: Output format - json, markdown, or html.
-            html_content: Original HTML content.
-            is_quiz: True for quiz, False for flashcards.
-
-        Returns:
-            Formatted content string.
-        """
-        if output_format == "html":
-            return html_content
-
-        if is_quiz:
-            questions = app_data.get("quiz", [])
-            if output_format == "markdown":
-                return _format_quiz_markdown(title, questions)
-            return json.dumps({"title": title, "questions": questions}, indent=2)
-
-        cards = app_data.get("flashcards", [])
-        if output_format == "markdown":
-            return _format_flashcards_markdown(title, cards)
-        normalized = [{"front": c.get("f", ""), "back": c.get("b", "")} for c in cards]
-        return json.dumps({"title": title, "cards": normalized}, indent=2)
-
-    async def download_report(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-    ) -> str:
-        """Download a report artifact as markdown.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the markdown file.
-            artifact_id: Specific artifact ID, or uses first completed report.
-
-        Returns:
-            The output path where the file was saved.
-        """
-        artifacts_data = await self._list_raw(notebook_id)
-
-        report_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 7
-            and a[2] == ArtifactTypeCode.REPORT
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        report_art = self._select_artifact(report_candidates, artifact_id, "Report", "report")
-
-        try:
-            content_wrapper = report_art[7]
-            markdown_content = (
-                content_wrapper[0]
-                if isinstance(content_wrapper, list) and content_wrapper
-                else content_wrapper
-            )
-
-            if not isinstance(markdown_content, str):
-                raise ArtifactParseError("report_content", details="Invalid structure")
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(markdown_content, encoding="utf-8")
-            return str(output)
-
-        except (IndexError, TypeError) as e:
-            raise ArtifactParseError(
-                "report", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
-
-    async def download_mind_map(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-    ) -> str:
-        """Download a mind map as JSON.
-
-        Mind maps are stored in the notes system, not the regular artifacts list.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the JSON file.
-            artifact_id: Specific mind map ID (note ID), or uses first available.
-
-        Returns:
-            The output path where the file was saved.
-        """
-        mind_maps = await self._notes.list_mind_maps(notebook_id)
-        if not mind_maps:
-            raise ArtifactNotReadyError("mind_map")
-
-        if artifact_id:
-            mind_map = next((mm for mm in mind_maps if mm[0] == artifact_id), None)
-            if not mind_map:
-                raise ArtifactNotFoundError(artifact_id, artifact_type="mind_map")
-        else:
-            mind_map = mind_maps[0]
-
-        try:
-            json_string = mind_map[1][1]
-            if not isinstance(json_string, str):
-                raise ArtifactParseError("mind_map_content", details="Invalid structure")
-
-            json_data = json.loads(json_string)
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(json_data, indent=2, ensure_ascii=False), encoding="utf-8")
-            return str(output)
-
-        except (IndexError, TypeError, json.JSONDecodeError) as e:
-            raise ArtifactParseError(
-                "mind_map", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
-
-    async def download_data_table(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-    ) -> str:
-        """Download a data table as CSV.
-
-        Args:
-            notebook_id: The notebook ID.
-            output_path: Path to save the CSV file.
-            artifact_id: Specific artifact ID, or uses first completed data table.
-
-        Returns:
-            The output path where the file was saved.
-        """
-        artifacts_data = await self._list_raw(notebook_id)
-
-        table_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 18
-            and a[2] == ArtifactTypeCode.DATA_TABLE
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        table_art = self._select_artifact(table_candidates, artifact_id, "Data table", "data table")
-
-        try:
-            raw_data = table_art[18]
-            headers, rows = _parse_data_table(raw_data)
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-            with output.open("w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                writer.writerows(rows)
-
-            return str(output)
-
-        except (IndexError, TypeError, ValueError) as e:
-            raise ArtifactParseError(
-                "data_table", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
-
-    async def download_quiz(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        output_format: str = "json",
-    ) -> str:
-        """Download quiz questions.
-
-        Args:
-            notebook_id: Notebook ID.
-            output_path: Output file path.
-            artifact_id: Specific quiz artifact ID (optional).
-            output_format: Output format - json, markdown, or html.
-
-        Returns:
-            Path to downloaded file.
-
-        Raises:
-            ValueError: If no completed quiz artifact found.
-        """
-        return await self._download_interactive_artifact(
-            notebook_id, output_path, artifact_id, output_format, "quiz"
+        """Format quiz or flashcard content as JSON, Markdown, or HTML."""
+        return _artifact_formatters._format_interactive_content(
+            app_data,
+            title,
+            output_format,
+            html_content,
+            is_quiz,
         )
-
-    async def download_flashcards(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        output_format: str = "json",
-    ) -> str:
-        """Download flashcard deck.
-
-        Args:
-            notebook_id: Notebook ID.
-            output_path: Output file path.
-            artifact_id: Specific flashcard artifact ID (optional).
-            output_format: Output format - json, markdown, or html.
-
-        Returns:
-            Path to downloaded file.
-
-        Raises:
-            ValueError: If no completed flashcard artifact found.
-        """
-        return await self._download_interactive_artifact(
-            notebook_id, output_path, artifact_id, output_format, "flashcards"
-        )
-
-    # =========================================================================
-    # Management Operations
-    # =========================================================================
-
-    async def delete(self, notebook_id: str, artifact_id: str) -> bool:
-        """Delete an artifact.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The artifact ID to delete.
-
-        Returns:
-            True if deletion succeeded.
-        """
-        logger.debug("Deleting artifact %s from notebook %s", artifact_id, notebook_id)
-        params = [[2], artifact_id]
-        await self._core.rpc_call(
-            RPCMethod.DELETE_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        return True
-
-    async def rename(self, notebook_id: str, artifact_id: str, new_title: str) -> None:
-        """Rename an artifact.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The artifact ID to rename.
-            new_title: The new title.
-        """
-        params = [[artifact_id, new_title], [["title"]]]
-        await self._core.rpc_call(
-            RPCMethod.RENAME_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-
-    async def poll_status(self, notebook_id: str, task_id: str) -> GenerationStatus:
-        """Poll the status of a generation task.
-
-        Args:
-            notebook_id: The notebook ID.
-            task_id: The task/artifact ID to check.
-
-        Returns:
-            GenerationStatus with current status.  When the artifact is not
-            found in the list, ``status`` is set to ``"not_found"`` so that
-            callers can distinguish "genuinely pending" from "removed by the
-            server" (e.g. after a quota rejection).
-
-        .. versionchanged:: 0.4.0
-            **Breaking change:** Previously returned ``status="pending"``
-            when an artifact was absent from the list.  Now returns
-            ``status="not_found"`` to allow callers to distinguish a
-            genuinely pending artifact from one that was removed.
-        """
-        # List all artifacts and find by ID (no poll-by-ID RPC exists)
-        artifacts_data = await self._list_raw(notebook_id)
-        for art in artifacts_data:
-            if len(art) > 0 and art[0] == task_id:
-                status_code = art[4] if len(art) > 4 else 0
-                artifact_type = art[2] if len(art) > 2 else 0
-
-                # For media artifacts, verify URL availability before reporting completion.
-                # The API may set status=COMPLETED before media URLs are populated.
-                if status_code == ArtifactStatus.COMPLETED:
-                    if not self._is_media_ready(art, artifact_type):
-                        type_name = self._get_artifact_type_name(artifact_type)
-                        logger.debug(
-                            "Artifact %s (type=%s) status=COMPLETED but media not ready, "
-                            "continuing poll",
-                            task_id,
-                            type_name,
-                        )
-                        # Downgrade to PROCESSING to continue polling
-                        status_code = ArtifactStatus.PROCESSING
-
-                status = artifact_status_to_str(status_code)
-
-                # Extract error details from failed artifacts.
-                # The API may embed an error reason string at art[3] when
-                # the artifact fails (e.g. daily quota exceeded).
-                error_msg: str | None = None
-                if status == "failed":
-                    error_msg = self._extract_artifact_error(art)
-
-                return GenerationStatus(
-                    task_id=task_id,
-                    status=status,
-                    error=error_msg,
-                )
-
-        # Artifact not found in the list.  Use a distinct status so
-        # wait_for_completion can differentiate from genuine "pending".
-        return GenerationStatus(task_id=task_id, status="not_found")
-
-    async def wait_for_completion(
-        self,
-        notebook_id: str,
-        task_id: str,
-        initial_interval: float = 2.0,
-        max_interval: float = 10.0,
-        timeout: float = 300.0,
-        poll_interval: float | None = None,  # Deprecated, use initial_interval
-        max_not_found: int = 5,
-        min_not_found_window: float = 10.0,
-    ) -> GenerationStatus:
-        """Wait for a generation task to complete.
-
-        Uses exponential backoff for polling to reduce API load.
-
-        Args:
-            notebook_id: The notebook ID.
-            task_id: The task/artifact ID to wait for.
-            initial_interval: Initial seconds between status checks.
-            max_interval: Maximum seconds between status checks.
-            timeout: Maximum seconds to wait.
-            poll_interval: Deprecated. Use initial_interval instead.
-            max_not_found: Consecutive "not found" polls before treating
-                the task as failed.  When the API removes an artifact
-                from the list (e.g. after a daily-quota rejection), the
-                poller would otherwise spin until *timeout*.  Defaults
-                to 5 to tolerate brief replication lag and slow networks.
-            min_not_found_window: Minimum seconds that must have elapsed
-                since the *first* not-found response before a consecutive
-                run triggers failure.  This avoids false positives on
-                slow or unreliable networks.  Defaults to 10.0.
-
-        Returns:
-            Final GenerationStatus.
-
-        Raises:
-            TimeoutError: If task doesn't complete within timeout.
-        """
-        # Backward compatibility: poll_interval overrides initial_interval
-        if poll_interval is not None:
-            import warnings
-
-            warnings.warn(
-                "poll_interval is deprecated, use initial_interval instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            initial_interval = poll_interval
-
-        start_time = asyncio.get_running_loop().time()
-        current_interval = initial_interval
-        consecutive_not_found = 0
-        total_not_found = 0
-        first_not_found_time: float | None = None
-        last_status: str | None = None
-
-        while True:
-            status = await self.poll_status(notebook_id, task_id)
-            last_status = status.status
-
-            if status.is_complete or status.is_failed:
-                return status
-
-            # Track consecutive and total "not found" responses.  The API
-            # may remove quota-rejected artifacts from the list entirely
-            # instead of setting them to FAILED.  We track both a
-            # consecutive run *and* a total count to handle "flickering"
-            # artifacts that alternate between found/not-found due to API
-            # replication lag.
-            if status.status == "not_found":
-                consecutive_not_found += 1
-                total_not_found += 1
-                now = asyncio.get_running_loop().time()
-                if first_not_found_time is None:
-                    first_not_found_time = now
-                not_found_elapsed = now - first_not_found_time
-
-                # Trigger failure when consecutive threshold is met AND
-                # enough wall-clock time has passed (avoids false positives
-                # on fast networks), OR when total not-found count is high
-                # enough to indicate flickering artifacts.
-                consecutive_trigger = (
-                    consecutive_not_found >= max_not_found
-                    and not_found_elapsed >= min_not_found_window
-                )
-                total_trigger = total_not_found >= max_not_found * 2
-
-                if consecutive_trigger or total_trigger:
-                    trigger = (
-                        f"consecutive={consecutive_not_found}"
-                        if consecutive_trigger
-                        else f"total={total_not_found}"
-                    )
-                    logger.warning(
-                        "Artifact %s disappeared from list (%s not-found polls, "
-                        "%s) — treating as failed",
-                        task_id,
-                        trigger,
-                        f"elapsed={not_found_elapsed:.1f}s",
-                    )
-                    return GenerationStatus(
-                        task_id=task_id,
-                        status="failed",
-                        error=(
-                            "Generation failed: artifact was removed by the server. "
-                            "This may indicate a daily quota/rate limit was exceeded, "
-                            "an invalid notebook ID, or a transient API issue. "
-                            "Try again later."
-                        ),
-                    )
-            else:
-                consecutive_not_found = 0
-
-            elapsed = asyncio.get_running_loop().time() - start_time
-            if elapsed > timeout:
-                raise TimeoutError(
-                    f"Task {task_id} timed out after {timeout}s (last status: {last_status})"
-                )
-
-            # Clamp sleep duration to respect timeout
-            remaining_time = timeout - elapsed
-            sleep_duration = min(current_interval, remaining_time)
-            if sleep_duration > 0:
-                await asyncio.sleep(sleep_duration)
-
-            # Exponential backoff: double the interval up to max_interval
-            current_interval = min(current_interval * 2, max_interval)
-
-    # =========================================================================
-    # Export Operations
-    # =========================================================================
 
     async def export_report(
         self,
@@ -1914,561 +1016,140 @@ class ArtifactsAPI:
         title: str = "Export",
         export_type: ExportType = ExportType.DOCS,
     ) -> Any:
-        """Export a report to Google Docs.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The report artifact ID.
-            title: Title for the exported document.
-            export_type: ExportType.DOCS (default) or ExportType.SHEETS.
-
-        Returns:
-            Export result with document URL.
-        """
-        params = [None, artifact_id, None, title, int(export_type)]
-        return await self._core.rpc_call(
-            RPCMethod.EXPORT_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
+        """Export a report to Google Docs (``export_type`` selects DOCS/SHEETS)."""
+        return await self.export(notebook_id, artifact_id, title, export_type)
 
     async def export_data_table(
-        self,
-        notebook_id: str,
-        artifact_id: str,
-        title: str = "Export",
+        self, notebook_id: str, artifact_id: str, title: str = "Export"
     ) -> Any:
-        """Export a data table to Google Sheets.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The data table artifact ID.
-            title: Title for the exported spreadsheet.
-
-        Returns:
-            Export result with spreadsheet URL.
-        """
-        params = [None, artifact_id, None, title, int(ExportType.SHEETS)]
-        return await self._core.rpc_call(
-            RPCMethod.EXPORT_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
+        """Export a data table to Google Sheets."""
+        return await self.export(notebook_id, artifact_id, title, ExportType.SHEETS)
 
     async def export(
         self,
         notebook_id: str,
         artifact_id: str | None = None,
-        content: str | None = None,
         title: str = "Export",
         export_type: ExportType = ExportType.DOCS,
+        *,
+        content: str | None = None,
     ) -> Any:
-        """Export an artifact to Google Docs/Sheets.
-
-        Generic export method for any artifact type.
-
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: The artifact ID (optional).
-            content: Content to export (optional).
-            title: Title for the exported document.
-            export_type: ExportType.DOCS (default) or ExportType.SHEETS.
-
-        Returns:
-            Export result with document URL.
-        """
-        params = [None, artifact_id, content, title, int(export_type)]
-        return await self._core.rpc_call(
-            RPCMethod.EXPORT_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
+        """Export any artifact to Drive; exactly one of ``artifact_id=``/``content=`` (``export_type`` picks Docs/Sheets)."""
+        _artifact_validation.check_exactly_one_export_target(artifact_id, content)
+        return await self._send_export(
+            notebook_id,
+            artifact_id,
+            title,
+            export_type,
+            content=content,
         )
 
-    # =========================================================================
-    # Suggestions
-    # =========================================================================
-
-    async def suggest_reports(
+    @abstractmethod
+    async def _send_export(
         self,
         notebook_id: str,
-    ) -> builtins.list[ReportSuggestion]:
-        """Get AI-suggested report formats for a notebook.
-
-        Args:
-            notebook_id: The notebook ID.
-
-        Returns:
-            List of ReportSuggestion objects.
-        """
-        params = [[2], notebook_id]
-
-        result = await self._core.rpc_call(
-            RPCMethod.GET_SUGGESTED_REPORTS,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-
-        suggestions = []
-        # Response format: [[[title, description, null, null, prompt, audience_level], ...]]
-        if result and isinstance(result, list) and len(result) > 0:
-            items = result[0] if isinstance(result[0], list) else result
-            for item in items:
-                if isinstance(item, list) and len(item) >= 5:
-                    suggestions.append(
-                        ReportSuggestion(
-                            title=item[0] if isinstance(item[0], str) else "",
-                            description=item[1] if isinstance(item[1], str) else "",
-                            prompt=item[4] if isinstance(item[4], str) else "",
-                            audience_level=item[5] if len(item) > 5 else 2,
-                        )
-                    )
-
-        return suggestions
-
-    # =========================================================================
-    # Private Helpers
-    # =========================================================================
-
-    async def _call_generate(
-        self, notebook_id: str, params: builtins.list[Any]
-    ) -> GenerationStatus:
-        """Make a generation RPC call with error handling.
-
-        Wraps the RPC call to handle UserDisplayableError (rate limiting/quota)
-        and convert to appropriate GenerationStatus.
-
-        Args:
-            notebook_id: The notebook ID.
-            params: RPC parameters for the generation call.
-
-        Returns:
-            GenerationStatus with task_id on success, or error info on failure.
-        """
-        # Extract artifact type from params for logging
-        artifact_type = params[2][2] if len(params) > 2 and len(params[2]) > 2 else "unknown"
-        logger.debug("Generating artifact type=%s in notebook %s", artifact_type, notebook_id)
-        try:
-            result = await self._core.rpc_call(
-                RPCMethod.CREATE_ARTIFACT,
-                params,
-                source_path=f"/notebook/{notebook_id}",
-                allow_null=True,
-            )
-            return self._parse_generation_result(result)
-        except RPCError as e:
-            if e.rpc_code == "USER_DISPLAYABLE_ERROR":
-                return GenerationStatus(
-                    task_id="",
-                    status="failed",
-                    error=str(e),
-                    error_code=str(e.rpc_code) if e.rpc_code is not None else None,
-                )
-            raise
-
-    async def _list_raw(self, notebook_id: str) -> builtins.list[Any]:
-        """Get raw artifact list data."""
-        params = [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
-        result = await self._core.rpc_call(
-            RPCMethod.LIST_ARTIFACTS,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        if result and isinstance(result, list) and len(result) > 0:
-            return result[0] if isinstance(result[0], list) else result
-        return []
-
-    def _select_artifact(
-        self,
-        candidates: builtins.list[Any],
         artifact_id: str | None,
-        type_name: str,
-        type_name_lower: str,
+        title: str,
+        export_type: ExportType,
+        *,
+        content: str | None,
     ) -> Any:
-        """Select an artifact from candidates by ID or return first available.
+        """Send one backend-specific Drive export request."""
 
-        Args:
-            candidates: List of candidate artifacts.
-            artifact_id: Specific artifact ID to select, or None for first.
-            type_name: Display name for error messages (e.g., "Report").
-            type_name_lower: Lowercase name for error messages (e.g., "report").
+    @abstractmethod
+    async def suggest_reports(self, notebook_id: str) -> builtins.list[ReportSuggestion]:
+        """Get AI-suggested report formats for a notebook."""
 
-        Returns:
-            Selected artifact data.
+    @abstractmethod
+    async def _send_copy(
+        self,
+        notebook_id: str,
+        artifact_ids: builtins.list[str],
+        target_notebook_id: str,
+    ) -> _ArtifactCopyResult:
+        """Copy artifacts and return decoded mappings plus wire diagnostics."""
 
-        Raises:
-            ValueError: If artifact not found or no candidates available.
+    async def copy(
+        self,
+        notebook_id: str,
+        artifact_ids: builtins.list[str],
+        target_notebook_id: str,
+    ) -> builtins.list[CopiedArtifact]:
+        """Copy artifacts under one admission through final mapping reconciliation."""
+        async with self._operation_scope("artifacts.copy"):
+            return await self._copy_in_scope(notebook_id, artifact_ids, target_notebook_id)
+
+    async def _copy_in_scope(
+        self,
+        notebook_id: str,
+        artifact_ids: builtins.list[str],
+        target_notebook_id: str,
+    ) -> builtins.list[CopiedArtifact]:
+        """Execute :meth:`copy` after its workflow admission has been acquired.
+
+        Returns one :class:`~notebooklm.types.CopiedArtifact` per copied
+        artifact, pairing the original id with the full new row (verified live
+        by re-listing the target). Raises
+        ``ArtifactNotFoundError`` when none of the requested ids were copied —
+        the server answers unknown ids with an empty mapping rather than
+        ``NOT_FOUND``. A partial result is returned with a warning because the
+        copies it names have already committed.
+
+        The sync twin ``CopyArtifacts`` (``zVGIdd``) accepts any ids, copies
+        nothing and reports success; it is deliberately not modelled (#2283).
+
+        .. versionadded:: 0.9.0
         """
-        if artifact_id:
-            artifact = next((a for a in candidates if a[0] == artifact_id), None)
-            if not artifact:
-                raise ArtifactNotReadyError(
-                    type_name.lower().replace(" ", "_"), artifact_id=artifact_id
-                )
-            return artifact
+        if not artifact_ids:
+            raise ValidationError("artifact_ids must not be empty")
+        if any(not artifact_id for artifact_id in artifact_ids):
+            raise ValidationError("artifact_ids must not contain empty entries")
+        if not target_notebook_id:
+            raise ValidationError("target_notebook_id must not be empty")
 
-        if not candidates:
-            raise ArtifactNotReadyError(type_name_lower)
-
-        # Sort by creation timestamp (descending) to get the latest.
-        # Timestamp is at index 15, position 0.
-        candidates.sort(
-            key=lambda a: a[15][0] if len(a) > 15 and isinstance(a[15], list) and a[15] else 0,
-            reverse=True,
+        transfer = await self._send_copy(notebook_id, artifact_ids, target_notebook_id)
+        return reconcile_copy_mapping(
+            artifact_ids,
+            transfer.items,
+            original_id=lambda item: item.original_id,
+            operation="CopyArtifactsAsync",
+            item_label="artifact",
+            target_notebook_id=target_notebook_id,
+            method_id=transfer.method_id,
+            malformed_count=transfer.malformed_count,
+            raw_response=transfer.raw_response,
+            empty_error=ArtifactNotFoundError(
+                ", ".join(artifact_ids), method_id=transfer.method_id
+            ),
+            warning_logger=logger,
         )
 
-        return candidates[0]
+    async def get_customization_choices(
+        self, notebook_id: str | None = None
+    ) -> ArtifactCustomizationChoices:
+        """Return the Studio "Customize" option tables (``GetArtifactCustomizationChoices``).
 
-    async def _download_urls_batch(
-        self, urls_and_paths: builtins.list[tuple[str, str]]
-    ) -> builtins.list[str]:
-        """Download multiple files using httpx with proper cookie handling.
+        Account-level: the server returns the same ~3.3 KB table for an empty
+        request, a bogus notebook id and every artifact type (live, both front
+        doors, 2026-09-01), so ``notebook_id`` is optional and only fills the
+        request's ``project_id`` slot. Audio / video / slide-deck rows carry the wire codes
+        of :class:`~notebooklm.types.AudioFormat`,
+        :class:`~notebooklm.types.VideoFormat` and
+        :class:`~notebooklm.types.SlideDeckFormat`; report presets carry the
+        full generation directive each preset expands to. This is an
+        availability table rather than an exhaustive enum manifest; dedicated
+        options such as cinematic video may be omitted.
 
-        Args:
-            urls_and_paths: List of (url, output_path) tuples.
-
-        Returns:
-            List of successfully downloaded output paths.
+        .. versionadded:: 0.9.0
         """
-        downloaded: list[str] = []
+        return await self._read_customization_choices(notebook_id)
 
-        # Load cookies with domain info for cross-domain redirect handling
-        cookies = load_httpx_cookies(path=self._storage_path)
+    @abstractmethod
+    async def _read_customization_choices(
+        self, notebook_id: str | None = None
+    ) -> ArtifactCustomizationChoices:
+        """Read and decode the selected backend's customization table."""
+        raise NotImplementedError
 
-        async with httpx.AsyncClient(
-            cookies=cookies,
-            follow_redirects=True,
-            timeout=60.0,
-        ) as client:
-            for url, output_path in urls_and_paths:
-                try:
-                    # Validate URL scheme and domain before sending auth cookies
-                    parsed = urlparse(url)
-                    if parsed.scheme != "https":
-                        raise ArtifactDownloadError(
-                            "media", details=f"Download URL must use HTTPS: {url[:80]}"
-                        )
-                    trusted = (".google.com", ".googleusercontent.com", ".googleapis.com")
-                    if not any(
-                        parsed.netloc == d.lstrip(".") or parsed.netloc.endswith(d) for d in trusted
-                    ):
-                        raise ArtifactDownloadError(
-                            "media", details=f"Untrusted download domain: {parsed.netloc}"
-                        )
 
-                    response = await client.get(url)
-                    response.raise_for_status()
-
-                    content_type = response.headers.get("content-type", "")
-                    if "text/html" in content_type:
-                        raise ArtifactDownloadError(
-                            "media", details="Received HTML instead of media file"
-                        )
-
-                    output_file = Path(output_path)
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-                    output_file.write_bytes(response.content)
-                    downloaded.append(output_path)
-                    logger.debug("Downloaded %s (%d bytes)", url[:60], len(response.content))
-
-                except (httpx.HTTPError, ValueError) as e:
-                    logger.warning("Download failed for %s: %s", url[:60], e)
-
-        return downloaded
-
-    async def _download_url(self, url: str, output_path: str) -> str:
-        """Download a file from URL using streaming with proper cookie handling.
-
-        Uses streaming download to handle large files (audio/video) without
-        loading entire file into memory, and with per-chunk timeouts instead
-        of a single timeout for the entire download.
-
-        Args:
-            url: URL to download from.
-            output_path: Path to save the file.
-
-        Returns:
-            The output path on success.
-
-        Raises:
-            ArtifactDownloadError: If download fails or authentication expired.
-        """
-        # Validate URL scheme and domain before sending auth cookies.
-        # httpx sends cookies to every request made by the client regardless of
-        # domain, so we must ensure the URL belongs to a trusted Google domain.
-        parsed = urlparse(url)
-        if parsed.scheme != "https":
-            raise ArtifactDownloadError("media", details=f"Download URL must use HTTPS: {url[:80]}")
-        trusted = (".google.com", ".googleusercontent.com", ".googleapis.com")
-        if not any(parsed.netloc == d.lstrip(".") or parsed.netloc.endswith(d) for d in trusted):
-            raise ArtifactDownloadError(
-                "media", details=f"Untrusted download domain: {parsed.netloc}"
-            )
-
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use temp file to avoid leaving corrupted partial files on failure
-        temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
-
-        # Load cookies with domain info for cross-domain redirect handling
-        cookies = load_httpx_cookies(path=self._storage_path)
-
-        # Use granular timeouts: 10s to connect, 30s per chunk read/write
-        # This allows large files to download without timeout while still
-        # detecting network failures quickly
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
-
-        try:
-            # Nested context managers required: client.stream() returns an async
-            # context manager that must run within the client's scope
-            async with httpx.AsyncClient(  # noqa: SIM117
-                cookies=cookies,
-                follow_redirects=True,
-                timeout=timeout,
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
-
-                    content_type = response.headers.get("content-type", "")
-                    if "text/html" in content_type:
-                        raise ArtifactDownloadError(
-                            "media",
-                            details="Download failed: received HTML instead of media file. "
-                            "Authentication may have expired. Run 'notebooklm login'.",
-                        )
-
-                    # Stream to file in chunks to handle large files efficiently
-                    total_bytes = 0
-                    with open(temp_file, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            f.write(chunk)
-                            total_bytes += len(chunk)
-
-                    if total_bytes == 0:
-                        raise ArtifactDownloadError(
-                            "media",
-                            details="Download produced 0 bytes -- the remote file may be missing or empty",
-                        )
-
-                    # Only move to final location on success
-                    temp_file.rename(output_file)
-                    logger.debug("Downloaded %s (%d bytes)", url[:60], total_bytes)
-                    return output_path
-        except Exception:
-            # Clean up partial temp file on any failure
-            temp_file.unlink(missing_ok=True)
-            raise
-
-    def _parse_generation_result(self, result: Any) -> GenerationStatus:
-        """Parse generation API result into GenerationStatus.
-
-        The API returns a single ID that serves as both the task_id (for polling
-        during generation) and the artifact_id (once complete). This ID is at
-        position [0][0] in the response and becomes Artifact.id in the list.
-        """
-        if result and isinstance(result, list) and len(result) > 0:
-            artifact_data = result[0]
-            artifact_id = (
-                artifact_data[0]
-                if isinstance(artifact_data, list) and len(artifact_data) > 0
-                else None
-            )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
-
-            if artifact_id:
-                status = (
-                    artifact_status_to_str(status_code) if status_code is not None else "pending"
-                )
-                return GenerationStatus(task_id=artifact_id, status=status)
-
-        return GenerationStatus(
-            task_id="", status="failed", error="Generation failed - no artifact_id returned"
-        )
-
-    @staticmethod
-    def _extract_artifact_error(art: builtins.list[Any]) -> str | None:
-        """Try to extract a human-readable error from a failed artifact.
-
-        Google's batchexecute responses embed error information in varying
-        positions depending on the artifact type.  This method walks through
-        known locations and returns the first non-empty string it finds.
-
-        Known error locations (reverse-engineered):
-        - art[3]: Sometimes contains an error reason string.
-        - art[5]: May contain a nested error payload similar to the
-          UserDisplayableError structure in RPC responses.
-
-        Args:
-            art: Raw artifact data from ``_list_raw()``.
-
-        Returns:
-            A human-readable error string, or ``None`` if no error detail
-            could be extracted.
-        """
-        try:
-            # art[3] — simple string error reason
-            if len(art) > 3 and isinstance(art[3], str) and art[3].strip():
-                return art[3].strip()
-
-            # art[5] — nested structure that may contain error text.
-            # NOTE: This position is protocol-dependent and was
-            # reverse-engineered; it may change without notice.
-            if len(art) > 5 and isinstance(art[5], list):
-                logger.debug(
-                    "Falling back to art[5] for error extraction (art[3]=%r)",
-                    art[3] if len(art) > 3 else "<missing>",
-                )
-                # Walk the list looking for the first non-empty string
-                for item in art[5]:
-                    if isinstance(item, str) and item.strip():
-                        return item.strip()
-                    if isinstance(item, list):
-                        for sub in item:
-                            if isinstance(sub, str) and sub.strip():
-                                return sub.strip()
-
-            return None
-        except Exception:
-            logger.warning(
-                "Failed to extract error from artifact data: %r",
-                art[:6] if len(art) > 6 else art,
-                exc_info=True,
-            )
-            return None
-
-    def _get_artifact_type_name(self, artifact_type: int) -> str:
-        """Get human-readable name for an artifact type.
-
-        Args:
-            artifact_type: The ArtifactTypeCode enum value.
-
-        Returns:
-            The enum name if valid, otherwise the raw integer as string.
-        """
-        try:
-            return ArtifactTypeCode(artifact_type).name
-        except ValueError:
-            return str(artifact_type)
-
-    def _is_valid_media_url(self, value: Any) -> bool:
-        """Check if value is a valid HTTP(S) URL.
-
-        Args:
-            value: The value to check.
-
-        Returns:
-            True if value is a string starting with http:// or https://.
-        """
-        return isinstance(value, str) and value.startswith(("http://", "https://"))
-
-    def _find_infographic_url(self, art: builtins.list[Any]) -> str | None:
-        """Extract infographic image URL from artifact data.
-
-        Infographic URLs are deeply nested in the artifact structure.
-        This method searches forward through the artifact to prefer the
-        canonical content URL over any later URL-containing fields.
-
-        Args:
-            art: Raw artifact data from _list_raw().
-
-        Returns:
-            The image URL if found, None otherwise.
-        """
-        for item in art:
-            if not isinstance(item, list) or len(item) <= 2:
-                continue
-            content = item[2]
-            if not isinstance(content, list) or len(content) == 0:
-                continue
-            first_content = content[0]
-            if not isinstance(first_content, list) or len(first_content) <= 1:
-                continue
-            img_data = first_content[1]
-            if isinstance(img_data, list) and len(img_data) > 0:
-                url = img_data[0]
-                if self._is_valid_media_url(url):
-                    return url
-        return None
-
-    def _is_media_ready(self, art: builtins.list[Any], artifact_type: int) -> bool:
-        """Check if media artifact has URLs populated.
-
-        For media artifacts (audio, video, infographic, slide deck), the API may
-        set status=COMPLETED before the actual media URLs are populated. This
-        method verifies that URLs are available for download.
-
-        Artifact array structure (from BATCHEXECUTE responses):
-        - art[0]: artifact_id
-        - art[2]: artifact_type (ArtifactTypeCode enum value)
-        - art[4]: status_code (ArtifactStatus enum value)
-        - art[6][5]: audio media URL list
-        - art[8]: video metadata containing URL list
-        - art[16][3]: slide deck PDF URL
-
-        Args:
-            art: Raw artifact data from _list_raw().
-            artifact_type: The ArtifactTypeCode enum value.
-
-        Returns:
-            True if media URLs are available, or if artifact is non-media type.
-            Returns True on unexpected structure (defensive fallback).
-        """
-        try:
-            if artifact_type == ArtifactTypeCode.AUDIO.value:
-                # Audio URL is at art[6][5] - check for non-empty media list
-                if len(art) > 6 and isinstance(art[6], list) and len(art[6]) > 5:
-                    media_list = art[6][5]
-                    if isinstance(media_list, list) and len(media_list) > 0:
-                        # Check first item has a valid URL
-                        first_item = media_list[0]
-                        if isinstance(first_item, list) and len(first_item) > 0:
-                            return self._is_valid_media_url(first_item[0])
-                return False
-
-            elif artifact_type == ArtifactTypeCode.VIDEO.value:
-                # Video URLs are in art[8] - check for any valid URL in the list
-                if len(art) > 8 and isinstance(art[8], list):
-                    return any(
-                        self._is_valid_media_url(item[0])
-                        for item in art[8]
-                        if isinstance(item, list) and len(item) > 0
-                    )
-                return False
-
-            elif artifact_type == ArtifactTypeCode.INFOGRAPHIC.value:
-                return self._find_infographic_url(art) is not None
-
-            elif artifact_type == ArtifactTypeCode.SLIDE_DECK.value:
-                # Slide deck PDF URL is at art[16][3]
-                return (
-                    len(art) > 16
-                    and isinstance(art[16], list)
-                    and len(art[16]) > 3
-                    and self._is_valid_media_url(art[16][3])
-                )
-
-            # Non-media artifacts (Report, Quiz, Flashcard, Data Table, Mind Map):
-            # Status code alone is sufficient for these types
-            return True
-
-        except (IndexError, TypeError) as e:
-            # Defensive: if structure is unexpected, be conservative for media types
-            # Media types need URLs, so return False to continue polling
-            # Non-media types only need status code, so return True
-            is_media = artifact_type in _MEDIA_ARTIFACT_TYPES
-            logger.debug(
-                "Unexpected artifact structure for type %s (media=%s): %s",
-                artifact_type,
-                is_media,
-                e,
-            )
-            return not is_media  # False for media (continue polling), True for non-media
+__all__ = ["ArtifactsAPI"]

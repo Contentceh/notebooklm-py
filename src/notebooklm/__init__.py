@@ -20,7 +20,13 @@ _check_python_version()
 del _check_python_version
 
 # Configure logging (must run before other imports that create loggers)
-from ._logging import configure_logging
+from ._logging import (
+    configure_logging,
+    correlation_id,
+    get_request_id,
+    reset_request_id,
+    set_request_id,
+)
 
 configure_logging()
 
@@ -48,67 +54,153 @@ from .client import NotebookLMClient
 
 # Public API: Exceptions (centralized in exceptions.py)
 from .exceptions import (
+    AmbiguousResearchTaskError,  # Domain: Research
     # Domain: Artifacts
     ArtifactDownloadError,
     ArtifactError,
+    ArtifactFeatureUnavailableError,
+    ArtifactInProgressTimeoutError,
     ArtifactNotFoundError,
     ArtifactNotReadyError,
     ArtifactParseError,
+    ArtifactPendingTimeoutError,
+    ArtifactTimeoutError,
     # RPC Protocol
     AuthError,
+    AuthExtractionError,
     # Domain: Chat
     ChatError,
+    ChatResponseParseError,
     ClientError,
+    # Domain: Collections
+    CollectionError,
+    CollectionNotFoundError,
     # Validation/Config
     ConfigurationError,
     DecodingError,
+    # Domain: Source labels
+    LabelError,
+    LabelNotFoundError,
+    MindMapError,
+    MindMapNotFoundError,
+    MissingDependencyError,
     # Network
     NetworkError,
+    # Idempotency
+    NonIdempotentRetryError,
     # Domain: Notebooks
     NotebookError,
+    NotebookLimitError,
     # Base
     NotebookLMError,
     NotebookNotFoundError,
+    NoteError,
+    NoteNotFoundError,
+    # Cross-domain umbrellas
+    NotFoundError,
+    OperationTimeoutError,
+    # Domain: Sources
+    PlayBookNotExportableError,
     RateLimitError,
+    ResearchError,
+    ResearchStartUnavailableError,
+    ResearchTaskMismatchError,
+    ResearchTimeoutError,
     RPCError,
+    RPCResponseTooLargeError,
     RPCTimeoutError,
     ServerError,
-    # Domain: Sources
     SourceAddError,
     SourceError,
     SourceNotFoundError,
     SourceProcessingError,
     SourceTimeoutError,
     UnknownRPCMethodError,
+    UnsupportedOperationError,
     ValidationError,
+    # Cross-domain umbrellas (wait/poll timeouts)
+    WaitTimeoutError,
 )
 
 # Public API: Types and dataclasses
 from .types import (
+    AccountLimits,
     Artifact,
+    ArtifactCreationCapability,
+    ArtifactCustomizationChoices,
+    ArtifactInfographic,
+    ArtifactListing,
+    ArtifactListingComponent,
+    ArtifactListingFailure,
+    ArtifactLookup,
+    ArtifactLookupStatus,
+    ArtifactMedia,
+    ArtifactMediaType,
+    ArtifactSlide,
     ArtifactType,
+    ArtifactUserState,
     AskResult,
+    AudioArtifactUserState,
     AudioFormat,
     AudioLength,
+    BlockKind,
+    BlockStyle,
     ChatGoal,
     ChatMode,
     ChatReference,
     ChatResponseLength,
+    ChatSession,
+    ChatSessionStatus,
+    CitedSourceSelection,
+    ClientMetricsSnapshot,
+    Collection,
+    ConnectionLimits,
     ConversationTurn,
+    ConversationTurnKey,
+    CopiedArtifact,
+    CopiedSource,
+    CustomizationChoice,
+    DiscoveryMode,
+    DocumentAnnotation,
+    DocumentBlock,
     DriveMimeType,
+    DriveSourceStatus,
+    ExpertIntelligenceSourceMetadata,
     ExportType,
+    FlashcardArtifactUserState,
+    GenerationState,
     GenerationStatus,
     InfographicDetail,
     InfographicOrientation,
     InfographicStyle,
+    Label,
+    ListInfo,
+    ListStyle,
+    MagicArtifactType,
+    MindMap,
+    MindMapKind,
+    MindMapResult,
+    NextStepSuggestion,
     Note,
     Notebook,
     NotebookDescription,
     NotebookMetadata,
+    PlayBook,
+    PlayBookExportReason,
+    PremiumFeatureInfo,
+    PromptSuggestion,
     QuizDifficulty,
     QuizQuantity,
+    RelevantChunk,
     ReportFormat,
+    ReportPreset,
     ReportSuggestion,
+    ResearchSource,
+    ResearchStart,
+    ResearchStatus,
+    ResearchTask,
+    ResearchTerminationReason,
+    RpcTelemetryEvent,
     ShareAccess,
     SharedUser,
     SharePermission,
@@ -117,78 +209,194 @@ from .types import (
     SlideDeckFormat,
     SlideDeckLength,
     Source,
+    SourceDeleteOutcome,
     SourceFulltext,
+    SourceGuide,
     SourceStatus,
     SourceSummary,
     SourceType,
+    StructuredDocument,
     # Enums for configuration
     SuggestedTopic,
+    TableCell,
+    TextSpan,
+    UnknownArtifactUserState,
     # Warnings
     UnknownTypeWarning,
+    UsageAction,
+    UsageActionCostTier,
+    UsageActionKind,
+    UsageSummary,
+    UsageSummaryStatus,
+    UsageWindow,
+    UsageWindowKind,
+    UserSettings,
     VideoFormat,
     VideoStyle,
+    utf16_len,
 )
 
+# Public API: Utility helpers
+from .utils import resolve_chat_reference_passage
+
 __all__ = [
+    "SourceDeleteOutcome",
+    "ArtifactCreationCapability",
     "__version__",
     # Client (main entry point)
     "NotebookLMClient",
     # Auth
     "AuthTokens",
+    # Observability
+    "correlation_id",
+    "get_request_id",
+    "set_request_id",
+    "reset_request_id",
     # Types
+    "AccountLimits",
+    "UserSettings",
+    "UsageSummary",
+    "UsageWindow",
+    "UsageAction",
+    "ConnectionLimits",
+    "ClientMetricsSnapshot",
+    "RpcTelemetryEvent",
     "Notebook",
+    "PremiumFeatureInfo",
+    "ChatSession",
+    "ChatSessionStatus",
     "NotebookDescription",
     "NotebookMetadata",
     "SuggestedTopic",
     "Source",
     "SourceFulltext",
+    "RelevantChunk",
+    "SourceGuide",
     "SourceSummary",
     "Artifact",
+    "ArtifactListing",
+    "ArtifactListingComponent",
+    "ArtifactListingFailure",
+    "ArtifactLookup",
+    "ArtifactLookupStatus",
+    "ArtifactInfographic",
+    "ArtifactMedia",
+    "ArtifactMediaType",
+    "ArtifactSlide",
+    "ArtifactUserState",
+    "AudioArtifactUserState",
+    "FlashcardArtifactUserState",
+    "UnknownArtifactUserState",
+    "GenerationState",
     "GenerationStatus",
+    "ReportPreset",
     "ReportSuggestion",
+    "MindMap",
+    "MindMapKind",
+    "MindMapResult",
     "Note",
+    "Label",
+    "Collection",
     "ConversationTurn",
+    "ConversationTurnKey",
+    "ArtifactCustomizationChoices",
+    "CopiedArtifact",
+    "CopiedSource",
+    "PlayBook",
+    "PlayBookExportReason",
+    "ExpertIntelligenceSourceMetadata",
+    "CustomizationChoice",
+    "NextStepSuggestion",
     "ChatReference",
     "AskResult",
     "ChatMode",
+    "PromptSuggestion",
+    "CitedSourceSelection",
+    "ResearchStatus",
+    "ResearchSource",
+    "ResearchTask",
+    "ResearchStart",
+    "ResearchTerminationReason",
     "SharedUser",
     "ShareStatus",
+    # Utility helpers
+    "resolve_chat_reference_passage",
     # Base Exceptions
     "NotebookLMError",
     "ValidationError",
     "ConfigurationError",
+    "UnsupportedOperationError",
+    "MissingDependencyError",
+    # Cross-domain umbrellas
+    "NotFoundError",
     # RPC/Network Exceptions
     "RPCError",
     "DecodingError",
     "UnknownRPCMethodError",
     "AuthError",
+    "AuthExtractionError",
     "NetworkError",
     "RPCTimeoutError",
+    "RPCResponseTooLargeError",
     "RateLimitError",
     "ServerError",
     "ClientError",
+    # Idempotency
+    "NonIdempotentRetryError",
     # Domain Exceptions: Notebooks
     "NotebookError",
     "NotebookNotFoundError",
+    "NotebookLimitError",
     # Domain Exceptions: Chat
     "ChatError",
+    "ChatResponseParseError",
     # Domain Exceptions: Sources
     "SourceError",
+    "PlayBookNotExportableError",
     "SourceAddError",
     "SourceProcessingError",
     "SourceTimeoutError",
     "SourceNotFoundError",
     # Domain Exceptions: Artifacts
     "ArtifactError",
+    "ArtifactFeatureUnavailableError",
     "ArtifactNotFoundError",
     "ArtifactNotReadyError",
     "ArtifactParseError",
     "ArtifactDownloadError",
+    "ArtifactTimeoutError",
+    "ArtifactPendingTimeoutError",
+    "ArtifactInProgressTimeoutError",
+    # Domain Exceptions: Research
+    "AmbiguousResearchTaskError",
+    "ResearchError",
+    "ResearchStartUnavailableError",
+    "ResearchTimeoutError",
+    "ResearchTaskMismatchError",
+    # Domain Exceptions: Notes
+    "NoteError",
+    "NoteNotFoundError",
+    # Domain Exceptions: Mind maps
+    "MindMapError",
+    "MindMapNotFoundError",
+    # Domain Exceptions: Source labels
+    "LabelError",
+    "LabelNotFoundError",
+    # Domain Exceptions: Collections
+    "CollectionError",
+    "CollectionNotFoundError",
+    # Cross-domain umbrella: wait/poll timeouts
+    "WaitTimeoutError",
+    "OperationTimeoutError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)
     "SourceType",
     "ArtifactType",
+    "UsageSummaryStatus",
+    "UsageWindowKind",
+    "UsageActionKind",
+    "UsageActionCostTier",
     # Configuration enums
     "AudioFormat",
     "AudioLength",
@@ -204,48 +412,23 @@ __all__ = [
     "ReportFormat",
     "ChatGoal",
     "ChatResponseLength",
+    "MagicArtifactType",
     "DriveMimeType",
     "ExportType",
     "SourceStatus",
+    "DriveSourceStatus",
+    "DiscoveryMode",
     "ShareAccess",
     "ShareViewLevel",
     "SharePermission",
-    # Deprecated (will be removed in v0.4.0)
-    "StudioContentType",
+    "BlockKind",
+    "BlockStyle",
+    "DocumentAnnotation",
+    "DocumentBlock",
+    "ListInfo",
+    "ListStyle",
+    "StructuredDocument",
+    "TableCell",
+    "TextSpan",
+    "utf16_len",
 ]
-
-
-def __getattr__(name: str):
-    """Emit deprecation warnings for deprecated module-level names.
-
-    This allows us to provide backward-compatible imports with warnings.
-    Uses globals() caching to avoid duplicate warnings on repeated access.
-    """
-    import warnings
-
-    if name == "DEFAULT_STORAGE_PATH":
-        from .paths import get_storage_path
-
-        warnings.warn(
-            "DEFAULT_STORAGE_PATH is deprecated, use notebooklm.paths.get_storage_path() instead. "
-            "Will be removed in v0.5.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        val = get_storage_path()
-        globals()[name] = val
-        return val
-
-    if name == "StudioContentType":
-        from .rpc.types import ArtifactTypeCode
-
-        warnings.warn(
-            "StudioContentType is deprecated, use ArtifactType instead. Will be removed in v0.4.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Cache to prevent duplicate warnings on repeated access
-        globals()[name] = ArtifactTypeCode
-        return ArtifactTypeCode
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

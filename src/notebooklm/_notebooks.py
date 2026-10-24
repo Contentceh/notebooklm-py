@@ -1,60 +1,145 @@
-"""Notebook operations API."""
+"""Backend-neutral notebook operations API."""
 
-import asyncio
+import builtins
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Any
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Any, Literal
+from urllib.parse import quote
 
-from ._core import ClientCore
-from .rpc import RPCMethod
-from .types import Notebook, NotebookDescription, SuggestedTopic
-
-if TYPE_CHECKING:
-    from ._sources import SourcesAPI
+from ._env import get_base_url
+from ._idempotency import (
+    OperationJournal,
+    bind_operation_journal_entries,
+    call_unconfirmed_on_transport_loss,
+    unresolved_commit_error,
+)
+from ._notebook_metadata import NotebookMetadataService, NotebookSourceLister, SpawnChild
+from ._runtime.call_supervisor import OperationLease
+from .exceptions import (
+    NetworkError,
+    NotebookNotFoundError,
+    RateLimitError,
+    RPCError,
+    ServerError,
+    ValidationError,
+)
+from .types import (
+    NextStepSuggestion,
+    Notebook,
+    NotebookDescription,
+    NotebookMetadata,
+    PromptSuggestion,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class NotebooksAPI:
-    """Operations on NotebookLM notebooks.
+ShareUrlBuilder = Callable[[str, str | None], str]
+_CopyFailureChain = Literal["explicit", "suppress"]
 
-    Provides methods for listing, creating, getting, deleting, and renaming
-    notebooks, as well as getting AI-generated descriptions.
 
-    Usage:
-        async with NotebookLMClient.from_storage() as client:
-            notebooks = await client.notebooks.list()
-            new_nb = await client.notebooks.create("My Research")
-            await client.notebooks.rename(new_nb.id, "Better Title")
+def build_share_url(base_url: str, notebook_id: str, artifact_id: str | None = None) -> str:
+    """Build the legacy NotebookLM notebook or artifact share URL.
+
+    Both IDs are percent-encoded with ``safe=""`` so reserved characters
+    (``/``, ``?``, ``&``, ``#``) and whitespace cannot escape the path /
+    query position and rewrite the URL into another endpoint.
+    """
+    notebook_url = f"{base_url}/notebook/{quote(notebook_id, safe='')}"
+    if artifact_id:
+        return f"{notebook_url}?artifactId={quote(artifact_id, safe='')}"
+    return notebook_url
+
+
+def _build_default_share_url(notebook_id: str, artifact_id: str | None = None) -> str:
+    """Build a share URL from the base URL resolved at call time."""
+    return build_share_url(get_base_url(), notebook_id, artifact_id)
+
+
+class NotebooksAPI(ABC):
+    """Backend-neutral operations on NotebookLM notebooks.
+
+    The public namespace class owns transport-independent orchestration. Concrete
+    backends implement each one-call operation and the create/copy send hooks.
     """
 
-    def __init__(self, core: ClientCore, sources_api: "SourcesAPI | None" = None):
-        """Initialize the notebooks API.
+    _create_method_id: str
+    _copy_method_id: str
+    _copy_failure_chain: _CopyFailureChain
+
+    @abstractmethod
+    def _operation_scope(
+        self, label: str
+    ) -> contextlib.AbstractAsyncContextManager[OperationLease | None]:
+        """Return the backend's scope for one multi-call workflow."""
+        raise NotImplementedError
+
+    def __init__(
+        self,
+        sources_api: NotebookSourceLister,
+        *,
+        spawn_child: SpawnChild,
+        metadata_service: NotebookMetadataService | None = None,
+        share_url_builder: ShareUrlBuilder = _build_default_share_url,
+    ) -> None:
+        """Initialize transport-neutral notebook state.
 
         Args:
-            core: The core client infrastructure.
-            sources_api: Optional sources API for cross-API calls. If None,
-                         creates a new instance (for backward compatibility).
+            sources_api: Source lister for cross-API metadata composition.
+            metadata_service: Optional explicit metadata service for tests or advanced wiring.
+            share_url_builder: Synchronous notebook/artifact share URL builder.
         """
-        self._core = core
-        # Lazy import to avoid circular dependency
-        from ._sources import SourcesAPI
+        self._sources = sources_api
+        self._metadata_service = metadata_service or NotebookMetadataService(
+            # Keep notebook lookup late-bound so tests and advanced callers that
+            # replace ``api.get`` after construction still affect get_metadata().
+            get_notebook=lambda notebook_id: self.get(notebook_id),
+            source_lister=self._sources,
+            spawn_child=spawn_child,
+        )
+        self._share_url_builder = share_url_builder
+        # CREATE_NOTEBOOK/COPY_PROJECT may volunteer a chat-session id that
+        # ChatAPI consumes once before falling back to a backend read. Producers
+        # and any eviction/cleanup policy stay backend-owned.
+        self._created_chat_session_ids: dict[str, str] = {}
 
-        self._sources = sources_api or SourcesAPI(core)
+    def _take_created_chat_session_id(self, notebook_id: str) -> str | None:
+        """Consume a create/copy response's volunteered chat-session id once."""
+        return self._created_chat_session_ids.pop(notebook_id, None)
 
-    async def list(self) -> list[Notebook]:
-        """List all notebooks.
+    @abstractmethod
+    async def get_source_ids(self, notebook_id: str) -> builtins.list[str]:
+        """Return all source IDs in a notebook."""
 
-        Returns:
-            List of Notebook objects.
+    @abstractmethod
+    async def suggest_prompts(
+        self,
+        notebook_id: str,
+        *,
+        source_ids: builtins.list[str] | None = None,
+        mode: int = 4,
+        query: str | None = None,
+    ) -> builtins.list[PromptSuggestion]:
+        """Return AI-suggested prompts for a notebook."""
+
+    @abstractmethod
+    async def suggest_next_steps(
+        self,
+        notebook_id: str,
+        *,
+        source_ids: builtins.list[str] | None = None,
+    ) -> builtins.list[NextStepSuggestion]:
+        """Return grounded follow-up questions for a notebook (``NextStepSuggestions``).
+
+        The standalone form of the ``next_steps`` block a chat answer carries.
+        ``source_ids=None`` scopes to every source in the notebook.
         """
-        logger.debug("Listing notebooks")
-        params = [None, 1, None, [2]]
-        result = await self._core.rpc_call(RPCMethod.LIST_NOTEBOOKS, params)
 
-        if result and isinstance(result, list) and len(result) > 0:
-            raw_notebooks = result[0] if isinstance(result[0], list) else result
-            return [Notebook.from_api_response(nb) for nb in raw_notebooks]
-        return []
+    @abstractmethod
+    async def list(self) -> builtins.list[Notebook]:
+        """List notebooks in backend-defined recent-first order."""
 
     async def create(self, title: str) -> Notebook:
         """Create a new notebook.
@@ -64,303 +149,126 @@ class NotebooksAPI:
 
         Returns:
             The created Notebook object.
-        """
-        logger.debug("Creating notebook: %s", title)
-        params = [title, None, None, [2], [1]]
-        result = await self._core.rpc_call(RPCMethod.CREATE_NOTEBOOK, params)
-        notebook = Notebook.from_api_response(result)
-        logger.debug("Created notebook: %s", notebook.id)
-        return notebook
 
+        Safety:
+            Sends the create exactly once. If the response is lost, the original
+            exception is preserved and marked unconfirmed; title matches from a
+            later list are not proof that this call created a notebook.
+        """
+        async with self._operation_scope("notebooks.create"):
+            logger.debug("Creating notebook: %s", title)
+            entry = OperationJournal("notebooks.create").new_entry(method=self._create_method_id)
+
+            async def _create() -> Notebook:
+                with bind_operation_journal_entries(entry):
+                    return await self._send_create(title)
+
+            return await call_unconfirmed_on_transport_loss(
+                _create,
+                method=self._create_method_id,
+                what="the notebook create",
+                journal_entry=entry,
+            )
+
+    @abstractmethod
+    async def _send_create(self, title: str) -> Notebook:
+        """Send one backend create operation and decode the notebook."""
+
+    async def copy(self, notebook_id: str, title: str) -> Notebook:
+        """Copy a notebook, including its sources and Studio artifacts.
+
+        ``CopyProject`` has no caller-provided idempotency token. Internal
+        transport retries are disabled so a lost response cannot create a
+        second copy. If the call fails after the server commits, callers must
+        disambiguate the intended copy from their notebook list.
+        """
+        if not notebook_id:
+            raise ValidationError("notebook_id must not be empty")
+        if not title or not title.strip():
+            raise ValidationError("title must not be empty")
+
+        async with self._operation_scope("notebooks.copy"):
+            try:
+                return await self._send_copy(notebook_id, title)
+            except (NetworkError, RateLimitError, ServerError) as exc:
+                rpc_code = exc.rpc_code if isinstance(exc, RPCError) else None
+                failure = unresolved_commit_error(
+                    self._copy_method_id,
+                    "CopyProject",
+                    RPCError(
+                        "UNRESOLVED — CopyProject may have committed before its response was "
+                        "lost. Do not blindly retry; list notebooks and resolve copies "
+                        "manually first.",
+                        method_id=self._copy_method_id,
+                        rpc_code=rpc_code,
+                    ),
+                    preserve_exception=True,
+                )
+                if self._copy_failure_chain == "explicit":
+                    raise failure from exc
+                raise failure from None
+
+    @abstractmethod
+    async def _send_copy(self, notebook_id: str, title: str) -> Notebook:
+        """Send one backend copy operation and decode the new notebook."""
+
+    @abstractmethod
     async def get(self, notebook_id: str) -> Notebook:
-        """Get notebook details.
+        """Get notebook details or raise ``NotebookNotFoundError``."""
 
-        Args:
-            notebook_id: The notebook ID.
+    async def get_or_none(self, notebook_id: str) -> Notebook | None:
+        """Get notebook details, returning ``None`` when it does not exist."""
+        try:
+            return await self.get(notebook_id)
+        except NotebookNotFoundError:
+            return None
 
-        Returns:
-            Notebook object with details.
-        """
-        params = [notebook_id, None, [2], None, 0]
-        result = await self._core.rpc_call(
-            RPCMethod.GET_NOTEBOOK,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-        )
-        # get_notebook returns [nb_info, ...] where nb_info contains the notebook data
-        nb_info = result[0] if result and isinstance(result, list) and len(result) > 0 else []
-        return Notebook.from_api_response(nb_info)
-
-    async def delete(self, notebook_id: str) -> bool:
-        """Delete a notebook.
-
-        Args:
-            notebook_id: The notebook ID to delete.
-
-        Returns:
-            True if deletion succeeded.
-        """
-        logger.debug("Deleting notebook: %s", notebook_id)
-        params = [[notebook_id], [2]]
-        await self._core.rpc_call(RPCMethod.DELETE_NOTEBOOK, params)
-        return True
+    @abstractmethod
+    async def delete(self, notebook_id: str) -> None:
+        """Delete a notebook."""
 
     async def rename(self, notebook_id: str, new_title: str) -> Notebook:
-        """Rename a notebook.
+        """Rename a notebook and return the refreshed notebook."""
+        return await self.update(notebook_id, title=new_title)
 
-        Args:
-            notebook_id: The notebook ID.
-            new_title: The new title for the notebook.
+    async def set_emoji(self, notebook_id: str, emoji: str) -> Notebook:
+        """Set a notebook's display emoji and return the refreshed notebook."""
+        return await self.update(notebook_id, emoji=emoji)
 
-        Returns:
-            The renamed Notebook object (fetched after rename).
-        """
-        logger.debug("Renaming notebook %s to: %s", notebook_id, new_title)
-        # Payload format discovered via browser traffic capture:
-        # [notebook_id, [[null, null, null, [null, new_title]]]]
-        params = [notebook_id, [[None, None, None, [None, new_title]]]]
-        await self._core.rpc_call(
-            RPCMethod.RENAME_NOTEBOOK,
-            params,
-            source_path="/",  # Home page context, not notebook page
-            allow_null=True,
-        )
-        # Fetch and return the updated notebook
-        return await self.get(notebook_id)
+    @abstractmethod
+    async def update(
+        self,
+        notebook_id: str,
+        *,
+        title: str | None = None,
+        emoji: str | None = None,
+    ) -> Notebook:
+        """Update a notebook's title and/or emoji in one mutation."""
 
+    @abstractmethod
     async def get_summary(self, notebook_id: str) -> str:
-        """Get raw summary text for a notebook.
+        """Get raw summary text for a notebook."""
 
-        For parsed summary with topics, use get_description() instead.
-
-        Args:
-            notebook_id: The notebook ID.
-
-        Returns:
-            Raw summary text string.
-        """
-        params = [notebook_id, [2]]
-        result = await self._core.rpc_call(
-            RPCMethod.SUMMARIZE,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-        )
-        # Response structure: [[[summary_string, ...], topics, ...]]
-        # Summary is at result[0][0][0]
-        try:
-            if result and isinstance(result, list):
-                summary = result[0][0][0]
-                return str(summary) if summary else ""
-        except (IndexError, TypeError):
-            pass
-        return ""
-
+    @abstractmethod
     async def get_description(self, notebook_id: str) -> NotebookDescription:
-        """Get AI-generated summary and suggested topics for a notebook.
+        """Get an AI-generated summary and suggested topics for a notebook."""
 
-        This provides a high-level overview of what the notebook contains,
-        similar to what's shown in the Chat panel when opening a notebook.
-
-        Args:
-            notebook_id: The notebook ID.
-
-        Returns:
-            NotebookDescription with summary and suggested topics.
-
-        Example:
-            desc = await client.notebooks.get_description(notebook_id)
-            print(desc.summary)
-            for topic in desc.suggested_topics:
-                print(f"Q: {topic.question}")
-        """
-        # Get raw summary data
-        params = [notebook_id, [2]]
-        result = await self._core.rpc_call(
-            RPCMethod.SUMMARIZE,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-        )
-
-        summary = ""
-        suggested_topics: list[SuggestedTopic] = []
-
-        # Response structure: [[[summary_string], [[topics]], ...]]
-        # Summary is at result[0][0][0], topics at result[0][1][0]
-        if result and isinstance(result, list):
-            try:
-                outer = result[0]
-
-                # Summary at outer[0][0]
-                summary_val = outer[0][0]
-                summary = str(summary_val) if summary_val else ""
-
-                # Suggested topics at outer[1][0]
-                topics_list = outer[1][0]
-                if isinstance(topics_list, list):
-                    for topic in topics_list:
-                        if isinstance(topic, list) and len(topic) >= 2:
-                            suggested_topics.append(
-                                SuggestedTopic(
-                                    question=str(topic[0]) if topic[0] else "",
-                                    prompt=str(topic[1]) if topic[1] else "",
-                                )
-                            )
-            except (IndexError, TypeError):
-                # A partial result (e.g. summary but no topics) is possible.
-                pass
-
-        return NotebookDescription(summary=summary, suggested_topics=suggested_topics)
-
+    @abstractmethod
     async def remove_from_recent(self, notebook_id: str) -> None:
-        """Remove a notebook from the recently viewed list.
+        """Remove a notebook from the recently viewed list."""
 
-        Args:
-            notebook_id: The notebook ID to remove from recent.
-        """
-        params = [notebook_id]
-        await self._core.rpc_call(
-            RPCMethod.REMOVE_RECENTLY_VIEWED,
-            params,
-            allow_null=True,
-        )
-
+    @abstractmethod
     async def get_raw(self, notebook_id: str) -> Any:
-        """Get raw notebook data from API.
-
-        This returns the raw API response, useful for accessing data
-        not parsed into the Notebook dataclass (like sources list).
-
-        Args:
-            notebook_id: The notebook ID.
-
-        Returns:
-            Raw API response data.
-        """
-        params = [notebook_id, None, [2], None, 0]
-        return await self._core.rpc_call(
-            RPCMethod.GET_NOTEBOOK,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-        )
-
-    async def share(
-        self, notebook_id: str, public: bool = True, artifact_id: str | None = None
-    ) -> dict:
-        """Toggle notebook sharing.
-
-        Note: This method uses SHARE_ARTIFACT for artifact-level sharing.
-        For notebook-level sharing with user management, use client.sharing instead:
-
-            await client.sharing.set_public(notebook_id, True)
-            await client.sharing.add_user(notebook_id, email, SharePermission.VIEWER)
-
-        Sharing is a NOTEBOOK-LEVEL setting. When enabled, ALL artifacts in the
-        notebook become accessible via their URLs.
-
-        Args:
-            notebook_id: The notebook ID.
-            public: If True, enable sharing. If False, disable sharing.
-            artifact_id: Optional artifact ID for generating a deep-link URL.
-
-        Returns:
-            Dict with 'public' status, 'url', and 'artifact_id'.
-        """
-        share_options = [1] if public else [0]
-        if artifact_id:
-            params = [share_options, notebook_id, artifact_id]
-        else:
-            params = [share_options, notebook_id]
-
-        await self._core.rpc_call(
-            RPCMethod.SHARE_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-
-        # Build share URL
-        base_url = f"https://notebooklm.google.com/notebook/{notebook_id}"
-        if public and artifact_id:
-            url = f"{base_url}?artifactId={artifact_id}"
-        elif public:
-            url = base_url
-        else:
-            url = None
-
-        return {
-            "public": public,
-            "url": url,
-            "artifact_id": artifact_id,
-        }
+        """Get undecoded notebook data from the backend."""
 
     def get_share_url(self, notebook_id: str, artifact_id: str | None = None) -> str:
-        """Get share URL for a notebook or artifact.
+        """Get a share URL without toggling server-side sharing."""
+        return self._share_url_builder(notebook_id, artifact_id)
 
-        This does NOT toggle sharing - it just returns the URL format.
-        Use share() to enable/disable sharing.
+    async def get_metadata(self, notebook_id: str) -> NotebookMetadata:
+        """Get notebook details composed with simplified source metadata."""
+        async with self._operation_scope("notebooks.get_metadata"):
+            return await self._metadata_service.get_metadata(notebook_id)
 
-        Args:
-            notebook_id: The notebook ID.
-            artifact_id: Optional artifact ID for a deep-link URL.
 
-        Returns:
-            The share URL string.
-        """
-        base_url = f"https://notebooklm.google.com/notebook/{notebook_id}"
-        if artifact_id:
-            return f"{base_url}?artifactId={artifact_id}"
-        return base_url
-
-    async def get_metadata(self, notebook_id: str):
-        """Get notebook metadata with sources list.
-
-        This combines notebook details with a simplified sources list,
-        useful for export/overview of notebook contents.
-
-        Uses asyncio.gather to fetch notebook and sources concurrently
-        for better performance.
-
-        Args:
-            notebook_id: The notebook ID.
-
-        Returns:
-            NotebookMetadata with notebook details and simplified sources list.
-
-        Example:
-            metadata = await client.notebooks.get_metadata(notebook_id)
-            print(f"Notebook: {metadata.title}")
-            print(f"Sources: {len(metadata.sources)}")
-            # Export to JSON
-            import json
-            print(json.dumps(metadata.to_dict(), indent=2))
-        """
-        # Get notebook details and sources list concurrently
-        notebook, sources = await asyncio.gather(
-            self.get(notebook_id),
-            self._sources.list(notebook_id),
-        )
-
-        # Warn on potential data loss
-        if notebook.sources_count > 0 and len(sources) == 0:
-            logger.warning(
-                "Notebook %s reports %d sources but listing returned empty",
-                notebook_id,
-                notebook.sources_count,
-            )
-
-        # Build simplified source info
-        from .types import NotebookMetadata, SourceSummary
-
-        simplified_sources = [
-            SourceSummary(
-                kind=source.kind,
-                title=source.title,
-                url=source.url,
-            )
-            for source in sources
-        ]
-
-        return NotebookMetadata(
-            notebook=notebook,
-            sources=simplified_sources,
-        )
+__all__ = ["NotebooksAPI"]

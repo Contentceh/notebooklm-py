@@ -162,6 +162,11 @@ jobs:
       # a real module (rare historical mentions are allowlisted, shrink-only).
       run: uv run python scripts/check_docs_module_refs.py
 
+    - name: Fetch upstream release tags for API baseline
+      # Forks may have no release tags. Do not force-update existing tags:
+      # a conflicting release identity must fail rather than change the baseline.
+      run: git fetch --no-tags https://github.com/teng-lin/notebooklm-py.git 'refs/tags/v*:refs/tags/v*'
+
     - name: Audit public API compatibility
       # ``--check-stale`` also fails when an allowlist entry matches no break
       # against the baseline (it is already in the baseline). This forces the

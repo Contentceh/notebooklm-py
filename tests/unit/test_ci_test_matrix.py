@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -115,7 +117,7 @@ def test_readonly_e2e_tests_never_request_mutating_managed_role_fixtures() -> No
 
 
 def test_test_matrix_is_independent_and_preserves_ci_contract() -> None:
-    """PRs use three full routine cells plus two conservative focused-OS cells."""
+    """Automatic runs keep canonical coverage; dispatch retains all five cells."""
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     jobs = workflow["jobs"]
 
@@ -127,11 +129,16 @@ def test_test_matrix_is_independent_and_preserves_ci_contract() -> None:
     assert jobs["test"]["strategy"]["fail-fast"] is False
 
     matrix = jobs["test"]["strategy"]["matrix"]
-    # The full 3-OS by 5-Python product is nightly's job (see
-    # ``test_nightly_runs_full_sha_pinned_compatibility_matrix``). PRs retain
-    # oldest/canonical/newest full Linux runs and two audited OS smoke cells.
+    # Parse only the approved expression grammar; never eval workflow content.
     assert set(matrix) == {"include"}
-    assert matrix["include"] == [
+    branches = re.fullmatch(
+        r"\$\{\{ fromJSON\(github\.event_name == 'workflow_dispatch' && "
+        r"'([^']+)' \|\| '([^']+)'\) \}\}",
+        matrix["include"],
+    )
+    assert branches is not None
+    manual, automatic = (json.loads(branch) for branch in branches.groups())
+    assert manual == [
         {
             "os": "ubuntu-latest",
             "python-version": "3.10",
@@ -168,7 +175,19 @@ def test_test_matrix_is_independent_and_preserves_ci_contract() -> None:
             "selection": "platform",
         },
     ]
-    assert {cell["os"] for cell in matrix["include"]} == set(SUPPORTED_OSES)
+    assert {cell["os"] for cell in manual} == set(SUPPORTED_OSES)
+    assert automatic == [
+        {
+            "os": "ubuntu-latest",
+            "python-version": "3.12",
+            "canonical": True,
+            "windows_playwright": False,
+            "selection": "full",
+        }
+    ]
+    assert "if" not in jobs["test"]
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"push", "pull_request", "workflow_dispatch"}
 
 
 def test_pr_matrix_runs_once_without_coverage_and_canonical_owns_reality() -> None:
@@ -591,8 +610,8 @@ def test_nightly_runs_full_sha_pinned_compatibility_matrix() -> None:
     assert "--no-cov" in suite_command
 
 
-def test_phase_six_keeps_daily_depth_until_observation_gate_is_proven() -> None:
-    """Do not silently trade the daily full product or stress floor for a weekly run."""
+def test_minimal_ci_preserves_nightly_depth_and_explicit_audit_triggers() -> None:
+    """Keep upstream nightly depth while limiting fork stress and dependency noise."""
     nightly = yaml.safe_load(NIGHTLY_CHECKS_WORKFLOW.read_text(encoding="utf-8"))
     triggers = nightly.get("on", nightly.get(True))
     assert {"cron": "0 6 * * *"} in triggers["schedule"]
@@ -605,8 +624,52 @@ def test_phase_six_keeps_daily_depth_until_observation_gate_is_proven() -> None:
         (PROJECT_ROOT / ".github" / "workflows" / "fault-stress.yml").read_text(encoding="utf-8")
     )
     stress_triggers = stress.get("on", stress.get(True))
-    assert "pull_request" in stress_triggers
-    assert stress_triggers["schedule"], "Daily stress coverage must remain scheduled"
+    assert set(stress_triggers) == {"workflow_dispatch"}
+    assert set(stress["jobs"]) == {"stress", "curl-stress", "process-death"}
+    assert "--require-all-scenarios" in str(stress["jobs"]["stress"])
+    assert "--require-all-scenarios" in str(stress["jobs"]["curl-stress"])
+
+    dependency = yaml.safe_load(
+        (PROJECT_ROOT / ".github" / "workflows" / "dependency-audit.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    dependency_triggers = dependency.get("on", dependency.get(True))
+    assert set(dependency_triggers) == {"push", "pull_request", "schedule", "workflow_dispatch"}
+    assert dependency_triggers["schedule"] == [{"cron": "0 6 * * 1"}]
+    for event in ("push", "pull_request"):
+        assert dependency_triggers[event]["paths"] == [
+            "pyproject.toml",
+            "uv.lock",
+            ".github/workflows/dependency-audit.yml",
+        ]
+    assert dependency_triggers["push"]["branches"] == ["main"]
+    audit = str(_step(dependency["jobs"]["pip-audit"], "pip-audit (locked env)")["run"])
+    assert "pip-audit --strict --require-hashes --disable-pip" in audit
+
+
+def test_quality_fetches_real_release_tags_without_bypassing_api_audit() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    quality = workflow["jobs"]["quality"]
+    checkout = next(
+        step
+        for step in quality["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
+    fetch = _step(quality, "Fetch upstream release tags for API baseline")
+    assert "if" not in fetch
+    assert fetch["run"] == (
+        "git fetch --no-tags https://github.com/teng-lin/notebooklm-py.git "
+        "'refs/tags/v*:refs/tags/v*'"
+    )
+    audit = _step(quality, "Audit public API compatibility")
+    assert "if" not in audit
+    assert audit["run"] == "uv run python scripts/audit_public_api_compat.py --check-stale"
+    assert quality["steps"].index(fetch) < quality["steps"].index(audit)
+    assert quality.get("continue-on-error", False) is False
+    assert audit.get("continue-on-error", False) is False
 
 
 def test_nightly_coverage_is_sha_pinned_secret_free_and_enforces_floors() -> None:

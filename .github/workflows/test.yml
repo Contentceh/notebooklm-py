@@ -197,38 +197,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Three full routine cells cover the oldest, canonical, and newest
-        # supported CPython versions. The secondary OS cells start with the
-        # audited platform manifest; high-risk or unclassifiable PRs expand
-        # those cells back to the full routine selector below. The complete
-        # 18-cell product remains in nightly-checks.yml until the observation
-        # criteria in the optimization plan have been met.
-        include:
-        - os: ubuntu-latest
-          python-version: "3.10"
-          canonical: false
-          windows_playwright: false
-          selection: full
-        - os: ubuntu-latest
-          python-version: "3.12"
-          canonical: true
-          windows_playwright: false
-          selection: full
-        - os: ubuntu-latest
-          python-version: "3.15"
-          canonical: false
-          windows_playwright: false
-          selection: full
-        - os: macos-latest
-          python-version: "3.12"
-          canonical: false
-          windows_playwright: false
-          selection: platform
-        - os: windows-latest
-          python-version: "3.12"
-          canonical: false
-          windows_playwright: true
-          selection: platform
+        # Automatic triggers run only the canonical cell; workflow_dispatch
+        # runs the complete five-cell compatibility matrix. Select rows during
+        # matrix expansion because jobs.<job_id>.if cannot inspect matrix.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"ubuntu-latest","python-version":"3.10","canonical":false,"windows_playwright":false,"selection":"full"},{"os":"ubuntu-latest","python-version":"3.12","canonical":true,"windows_playwright":false,"selection":"full"},{"os":"ubuntu-latest","python-version":"3.15","canonical":false,"windows_playwright":false,"selection":"full"},{"os":"macos-latest","python-version":"3.12","canonical":false,"windows_playwright":false,"selection":"platform"},{"os":"windows-latest","python-version":"3.12","canonical":false,"windows_playwright":true,"selection":"platform"}]' || '[{"os":"ubuntu-latest","python-version":"3.12","canonical":true,"windows_playwright":false,"selection":"full"}]') }}
     env:
       # Pin Playwright's browser install dir to a single workspace-relative
       # path on every OS. The previous dual-path cache stanza (``~/.cache``
